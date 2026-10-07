@@ -38,7 +38,7 @@ from telegram.ext import (
 
 BOT_TOKEN        = "8863364842:AAHDABiyJvPp7RKmdx6sDA1JS1eBMlPvtKA"
 ADMIN_CHAT_ID    = -1004441293896
-CHAT_INVITE_LINK = "https://t.me/klenowiybuketik"
+CHAT_INVITE_LINK = "https://t.me/+Ri7977iweXdiMzMy"
 RULES_LINK       = "https://telegra.ph/Pravila-Klenovogo-buketika-10-07"
 DB_PATH          = "bot.db"
 THROTTLE_SECONDS = 2.0
