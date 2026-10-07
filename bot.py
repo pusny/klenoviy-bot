@@ -6,7 +6,6 @@ try:
 except ImportError:
     subprocess.check_call([sys.executable, "-m", "pip", "install", "python-telegram-bot>=20,<22"])
 
-from __future__ import annotations
 
 import asyncio
 import html
