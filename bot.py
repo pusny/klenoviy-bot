@@ -38,7 +38,7 @@ from telegram.ext import (
 
 BOT_TOKEN        = "8863364842:AAHDABiyJvPp7RKmdx6sDA1JS1eBMlPvtKA"
 ADMIN_CHAT_ID    = -1004441293896
-CHAT_INVITE_LINK = "https://t.me/+Ri7977iweXdiMzMy"
+CHAT_INVITE_LINK = "https://t.me/klenowiybuketik"
 RULES_LINK       = "https://telegra.ph/Pravila-Klenovogo-buketika-10-07"
 DB_PATH          = "bot.db"
 THROTTLE_SECONDS = 2.0
@@ -453,6 +453,10 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if message is None or user is None:
         return
 
+    # Только личка
+    if message.chat.type != "private":
+        return
+
     log.info("/start from %s (@%s)", user.id, user.username or "-")
 
     if await is_blacklisted(user.id):
@@ -606,7 +610,6 @@ def _build_admin_text(app_row, tg_user) -> str:
     safe_name = esc(app_row["name"])
     about_value = esc(app_row["about"]) if app_row["about"] else "—"
 
-    # HTML-упоминание — кликабельно всегда, даже если нет username
     mention = f'<a href="tg://user?id={user_id}">{esc(first_name)}</a>'
 
     return (
@@ -630,6 +633,10 @@ async def on_user_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
     user = update.effective_user
     if message is None or user is None or message.text is None:
+        return
+
+    # ⛔ Ничего не делаем в группах — там сообщения не трогаем
+    if message.chat.type != "private":
         return
 
     if is_throttled(user.id):
@@ -719,7 +726,10 @@ async def on_user_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def _try_delete(message) -> None:
+    # Никогда не удаляем сообщения в админ-чате
     try:
+        if message.chat_id == ADMIN_CHAT_ID:
+            return
         await message.delete()
     except Exception:
         pass
@@ -943,9 +953,22 @@ async def _build_app() -> Application:
     app.add_handler(CallbackQueryHandler(cb_ping_admins, pattern=r"^ping_admins$"))
     app.add_handler(CallbackQueryHandler(cb_agree,   pattern=r"^agree$"))
     app.add_handler(CallbackQueryHandler(cb_refuse,  pattern=r"^refuse$"))
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("unban", cmd_unban))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_user_text))
+
+    # Команды — только в личке
+    app.add_handler(CommandHandler(
+        "start", cmd_start,
+        filters=filters.ChatType.PRIVATE,
+    ))
+    app.add_handler(CommandHandler(
+        "unban", cmd_unban,
+        filters=filters.ChatType.PRIVATE,
+    ))
+
+    # Текстовые сообщения — только в личке, группы игнорируем
+    app.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE,
+        on_user_text,
+    ))
     app.add_error_handler(_error_handler)
     return app
 
