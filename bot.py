@@ -600,16 +600,20 @@ def _pop(user_id: int) -> list[int]:
 def _build_admin_text(app_row, tg_user) -> str:
     username = tg_user.username
     user_id = tg_user.id
+    first_name = tg_user.first_name or "—"
 
     username_display = f"@{esc(username)}" if username else "без username"
     safe_name = esc(app_row["name"])
     about_value = esc(app_row["about"]) if app_row["about"] else "—"
 
+    # HTML-упоминание — кликабельно всегда, даже если нет username
+    mention = f'<a href="tg://user?id={user_id}">{esc(first_name)}</a>'
+
     return (
         "📩 <b>Новая заявка</b>\n\n"
         f"👤 <b>Отправитель:</b> {username_display} ({safe_name})\n"
         f"🆔 <b>user_id:</b> <code>{user_id}</code>\n"
-        f"🔗 <b>Профиль:</b> <a href=\"tg://user?id={user_id}\">открыть</a>\n\n"
+        f"🔗 <b>Профиль:</b> {mention}\n\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
         "📋 <b>Анкета:</b>\n\n"
         f"<b>Имя:</b> {esc(app_row['name'])}\n"
