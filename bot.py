@@ -1,10 +1,53 @@
 import subprocess
 import sys
 
-try:
-    import telegram
-except ImportError:
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "python-telegram-bot>=20,<22"])
+
+def _ensure(pkg_spec: str, import_name: str) -> None:
+    try:
+        __import__(import_name)
+    except ImportError:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", pkg_spec])
+
+
+_ensure("python-telegram-bot>=20,<22", "telegram")
+_ensure("python-dotenv", "dotenv")
+
+
+import os
+from pathlib import Path
+from typing import Optional
+
+from dotenv import load_dotenv
+
+load_dotenv()
+
+
+def _req(key: str) -> str:
+    val = os.getenv(key)
+    if val is None or val.strip() == "":
+        raise RuntimeError(
+            f"Не задана обязательная переменная окружения: {key}. "
+            f"Проверь .env в рабочей директории ({Path.cwd()})"
+        )
+    return val.strip()
+
+
+BOT_TOKEN = _req("BOT_TOKEN")
+
+ADMIN_CHAT_ID    = -1004441293896
+CHAT_INVITE_LINK = "https://t.me/+Ri7977iweXdiMzMy"
+RULES_LINK       = "https://telegra.ph/Pravila-Klenovogo-buketika-10-07"
+DB_PATH          = "bot.db"
+
+TOPIC_THREAD_ID: Optional[int] = 422
+
+THROTTLE_SECONDS      = 2.0
+PING_COOLDOWN_SECONDS = 3600.0
+CONNECT_TIMEOUT       = 30.0
+READ_TIMEOUT          = 30.0
+WRITE_TIMEOUT         = 30.0
+POOL_TIMEOUT          = 30.0
+START_RETRY_DELAY     = 10.0
 
 
 import asyncio
@@ -16,8 +59,6 @@ import time
 from collections import defaultdict
 from dataclasses import dataclass
 from logging.handlers import RotatingFileHandler
-from pathlib import Path
-from typing import Optional
 
 from telegram import (
     BotCommand,
@@ -36,20 +77,6 @@ from telegram.ext import (
     filters,
 )
 
-BOT_TOKEN        = "8863364842:AAHDABiyJvPp7RKmdx6sDA1JS1eBMlPvtKA"
-ADMIN_CHAT_ID    = -1004441293896
-CHAT_INVITE_LINK = "https://t.me/+Ri7977iweXdiMzMy"
-RULES_LINK       = "https://telegra.ph/Pravila-Klenovogo-buketika-10-07"
-DB_PATH          = "bot.db"
-THROTTLE_SECONDS = 2.0
-TOPIC_THREAD_ID: Optional[int] = 422
-PING_COOLDOWN_SECONDS = 3600.0
-CONNECT_TIMEOUT  = 30.0
-READ_TIMEOUT     = 30.0
-WRITE_TIMEOUT    = 30.0
-POOL_TIMEOUT     = 30.0
-START_RETRY_DELAY = 10.0
-
 Path("logs").mkdir(exist_ok=True)
 _fmt = logging.Formatter(
     "%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
@@ -67,6 +94,9 @@ if not log.handlers:
 
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
+
+log.info("Config loaded | cwd=%s | admin_chat=%s | thread=%s",
+         Path.cwd(), ADMIN_CHAT_ID, TOPIC_THREAD_ID)
 
 
 def esc(value) -> str:
@@ -165,6 +195,8 @@ CREATE TABLE IF NOT EXISTS applications (
     about                 TEXT,
     status                TEXT NOT NULL DEFAULT 'pending',
     admin_msg_id          INTEGER,
+    video_note_file_id    TEXT,
+    video_admin_msg_id    INTEGER,
     created_at            TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     decided_by            INTEGER,
     decided_at            TIMESTAMP
@@ -184,6 +216,13 @@ CREATE TABLE IF NOT EXISTS blacklist (
 def _sync_init_db() -> None:
     with sqlite3.connect(DB_PATH) as conn:
         conn.executescript(SCHEMA)
+
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(applications)")}
+        if "video_note_file_id" not in cols:
+            conn.execute("ALTER TABLE applications ADD COLUMN video_note_file_id TEXT")
+        if "video_admin_msg_id" not in cols:
+            conn.execute("ALTER TABLE applications ADD COLUMN video_admin_msg_id INTEGER")
+
         conn.commit()
 
 
@@ -254,7 +293,7 @@ async def remove_from_blacklist(user_id: int) -> None:
 
 async def has_active_application(user_id: int) -> bool:
     row = await db_exec(
-        "SELECT 1 FROM applications WHERE user_id = ? AND status = 'pending'",
+        "SELECT 1 FROM applications WHERE user_id = ? AND status IN ('pending', 'awaiting_video')",
         (user_id,), fetch="one",
     )
     return row is not None
@@ -272,16 +311,17 @@ async def create_application(
     username_at_submit: Optional[str],
     first_name_at_submit: Optional[str],
     name: str, age: str, diseases: str, reason: str, about: Optional[str],
+    status: str = "pending",
 ) -> int:
     return await db_exec(
         """
         INSERT INTO applications
             (user_id, username_at_submit, first_name_at_submit,
              name, age, diseases, reason, about, status, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', CURRENT_TIMESTAMP)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
         """,
         (user_id, username_at_submit, first_name_at_submit,
-         name, age, diseases, reason, about),
+         name, age, diseases, reason, about, status),
     )
 
 
@@ -289,10 +329,31 @@ async def get_application(app_id: int):
     return await db_exec("SELECT * FROM applications WHERE id = ?", (app_id,), fetch="one")
 
 
+async def set_application_status(app_id: int, status: str) -> None:
+    await db_exec(
+        "UPDATE applications SET status = ? WHERE id = ?",
+        (status, app_id),
+    )
+
+
+async def set_video_note(app_id: int, file_id: str) -> None:
+    await db_exec(
+        "UPDATE applications SET video_note_file_id = ? WHERE id = ?",
+        (file_id, app_id),
+    )
+
+
 async def set_admin_msg_id(app_id: int, admin_msg_id: int) -> None:
     await db_exec(
         "UPDATE applications SET admin_msg_id = ? WHERE id = ?",
         (admin_msg_id, app_id),
+    )
+
+
+async def set_video_admin_msg_id(app_id: int, msg_id: int) -> None:
+    await db_exec(
+        "UPDATE applications SET video_admin_msg_id = ? WHERE id = ?",
+        (msg_id, app_id),
     )
 
 
@@ -441,6 +502,23 @@ INVALID_FORM_TEXT = (
     "Пожалуйста, заполните все обязательные поля и отправьте анкету одним сообщением."
 )
 
+VIDEO_REQUEST_TEXT = (
+    "📹 <b>Подтверждение возраста</b>\n\n"
+    "Чтобы мы могли убедиться, что вам есть 18 лет, "
+    "запишите, пожалуйста, <b>видео-кружок</b> (до 60 секунд), "
+    "в котором вы называете свой возраст и имя, указанное в анкете.\n\n"
+    "Кружок отправляется нажатием на значок 🎥 слева от поля ввода — "
+    "обычное видео или фото не подойдут.\n\n"
+    "После получения кружка ваша заявка уйдёт на рассмотрение администрации."
+)
+
+VIDEO_REMINDER_TEXT = (
+    "⚠️ Пожалуйста, отправьте именно <b>видео-кружок</b> (круглое видео до 60 секунд).\n\n"
+    "Нажмите значок 🎥 рядом с полем ввода и запишите короткое видео, "
+    "в котором называете свой возраст и имя из анкеты.\n\n"
+    "Текст, фото или обычное видео не принимаются."
+)
+
 WAITING_TEXT = (
     "⏳ Ожидайте, вашу заявку рассматривают.\n\n"
     "Если ответа нет долго — нажмите кнопку ниже, чтобы привлечь внимание администрации."
@@ -453,7 +531,6 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if message is None or user is None:
         return
 
-    # Только личка
     if message.chat.type != "private":
         return
 
@@ -465,6 +542,14 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     db_user = await get_user(user.id)
 
     if db_user and db_user["state"] in ("approved", "rejected"):
+        return
+
+    if db_user and db_user["state"] == "awaiting_video":
+        await _send_tracked(
+            ctx.bot, user.id,
+            text=VIDEO_REQUEST_TEXT,
+            parse_mode=ParseMode.HTML,
+        )
         return
 
     if db_user and db_user["state"] == "pending":
@@ -635,7 +720,6 @@ async def on_user_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if message is None or user is None or message.text is None:
         return
 
-    # ⛔ Ничего не делаем в группах — там сообщения не трогаем
     if message.chat.type != "private":
         return
 
@@ -654,6 +738,15 @@ async def on_user_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     if state in ("rejected", "approved"):
         await _try_delete(message)
+        return
+
+    if state == "awaiting_video":
+        await _try_delete(message)
+        await _send_tracked(
+            ctx.bot, user.id,
+            text=VIDEO_REMINDER_TEXT,
+            parse_mode=ParseMode.HTML,
+        )
         return
 
     if state != "awaiting_form":
@@ -690,14 +783,52 @@ async def on_user_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         diseases=parsed.diseases,
         reason=parsed.reason,
         about=parsed.about,
+        status="awaiting_video",
     )
-    await set_user_state(user.id, "pending")
-
-    app_row = await get_application(app_id)
+    await set_user_state(user.id, "awaiting_video")
 
     for mid in _pop(user.id):
         await safe(ctx.bot.delete_message, chat_id=message.chat_id, message_id=mid)
     await safe(ctx.bot.delete_message, chat_id=message.chat_id, message_id=message.message_id)
+
+    await _send_tracked(
+        ctx.bot, user.id,
+        text=VIDEO_REQUEST_TEXT,
+        parse_mode=ParseMode.HTML,
+    )
+
+    log.info("Application %s from user %s — awaiting video note", app_id, user.id)
+
+
+async def on_user_video_note(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    user = update.effective_user
+    if message is None or user is None or message.video_note is None:
+        return
+
+    if message.chat.type != "private":
+        return
+
+    if await is_blacklisted(user.id):
+        await _try_delete(message)
+        return
+
+    db_user = await get_user(user.id)
+    if not db_user or db_user["state"] != "awaiting_video":
+        return
+
+    app_row = await get_latest_application(user.id)
+    if app_row is None or app_row["status"] != "awaiting_video":
+        return
+
+    app_id = app_row["id"]
+    file_id = message.video_note.file_id
+
+    await set_video_note(app_id, file_id)
+    await set_application_status(app_id, "pending")
+    await set_user_state(user.id, "pending")
+
+    await safe(ctx.bot.delete_message, chat_id=user.id, message_id=message.message_id)
 
     await _send_tracked(
         ctx.bot, user.id,
@@ -706,9 +837,17 @@ async def on_user_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         reply_markup=waiting_keyboard(),
     )
 
+    video_msg = await safe(
+        ctx.bot.send_video_note,
+        chat_id=ADMIN_CHAT_ID,
+        video_note=file_id,
+        **_topic_kwargs(),
+    )
+    if video_msg is not None:
+        await set_video_admin_msg_id(app_id, video_msg.message_id)
+
     admin_text = _build_admin_text(app_row, user)
-    admin_msg = await safe(
-        ctx.bot.send_message,
+    send_kwargs = dict(
         chat_id=ADMIN_CHAT_ID,
         text=admin_text,
         parse_mode=ParseMode.HTML,
@@ -716,17 +855,21 @@ async def on_user_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         disable_web_page_preview=True,
         **_topic_kwargs(),
     )
+    if video_msg is not None:
+        send_kwargs["reply_to_message_id"] = video_msg.message_id
+        send_kwargs["allow_sending_without_reply"] = True
+
+    admin_msg = await safe(ctx.bot.send_message, **send_kwargs)
     if admin_msg is not None:
         await set_admin_msg_id(app_id, admin_msg.message_id)
     else:
         log.warning("App %s — не доставлено в ветку, но в БД сохранено", app_id)
 
-    log.info("Application %s from user %s submitted to thread %s",
+    log.info("Application %s from user %s fully submitted (video + form) to thread %s",
              app_id, user.id, TOPIC_THREAD_ID)
 
 
 async def _try_delete(message) -> None:
-    # Никогда не удаляем сообщения в админ-чате
     try:
         if message.chat_id == ADMIN_CHAT_ID:
             return
@@ -954,7 +1097,6 @@ async def _build_app() -> Application:
     app.add_handler(CallbackQueryHandler(cb_agree,   pattern=r"^agree$"))
     app.add_handler(CallbackQueryHandler(cb_refuse,  pattern=r"^refuse$"))
 
-    # Команды — только в личке
     app.add_handler(CommandHandler(
         "start", cmd_start,
         filters=filters.ChatType.PRIVATE,
@@ -964,7 +1106,11 @@ async def _build_app() -> Application:
         filters=filters.ChatType.PRIVATE,
     ))
 
-    # Текстовые сообщения — только в личке, группы игнорируем
+    app.add_handler(MessageHandler(
+        filters.VIDEO_NOTE & filters.ChatType.PRIVATE,
+        on_user_video_note,
+    ))
+
     app.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE,
         on_user_text,
