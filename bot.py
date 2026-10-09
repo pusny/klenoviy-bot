@@ -683,16 +683,16 @@ RULES_TEXT = (
 FORM_TEXT = (
     f"{step_done(1)}\n\n"
     f"{step_header(2, 'Анкета')}\n\n"
-    "Скопируйте шаблон ниже — <i>тап по блоку = копирование</i>.\n"
+    "Скопируйте шаблон ниже — <i>тап по тексту = копирование</i>.\n"
     "Заполните все поля и отправьте <b>одним сообщением</b>.\n\n"
     "━━━━━━━━━━━━━━━━━━━━\n"
-    "<pre>"
+    "<code>"
     "Имя: \n"
     "Возраст: \n"
     "Болезни физические/психические: \n"
     "Почему хотите зайти к нам: \n"
     "О себе по желанию: "
-    "</pre>\n"
+    "</code>\n"
     "━━━━━━━━━━━━━━━━━━━━\n\n"
     "<i>Обязательные поля: Имя, Возраст, Болезни, Причина.</i>"
 )
@@ -741,20 +741,17 @@ REJECTED_MSG = (
     "Если считаете решение ошибочным — можете подать апелляцию ниже."
 )
 
-APPEAL_FORM_HEADER = (
+APPEAL_FORM_TEXT = (
     "⚖️ <b>Апелляция</b>\n\n"
-    "Скопируйте шаблон ниже — <i>тап по блоку = копирование</i>.\n"
-    "Заполните все поля и отправьте <b>одним сообщением</b>."
-)
-
-APPEAL_FORM_BODY = (
+    "Скопируйте шаблон ниже — <i>тап по тексту = копирование</i>.\n"
+    "Заполните все поля и отправьте <b>одним сообщением</b>.\n\n"
     "━━━━━━━━━━━━━━━━━━━━\n"
-    "<pre>"
+    "<code>"
     "Имя: \n"
     "Возраст: \n"
     "Тип наказания: \n"
     "Краткое описание: "
-    "</pre>\n"
+    "</code>\n"
     "━━━━━━━━━━━━━━━━━━━━\n\n"
     "<i>Обязательные поля: Имя, Возраст, Тип наказания, Описание.</i>"
 )
@@ -774,8 +771,7 @@ APPEAL_WAITING_TEXT = (
 
 
 async def _send_appeal_form(bot, user_id: int) -> None:
-    await send_msg(bot, user_id, text=APPEAL_FORM_HEADER, parse_mode=ParseMode.HTML)
-    await send_msg(bot, user_id, text=APPEAL_FORM_BODY, parse_mode=ParseMode.HTML)
+    await send_msg(bot, user_id, text=APPEAL_FORM_TEXT, parse_mode=ParseMode.HTML)
 
 
 def _blocked_text(until_str: str) -> str:
