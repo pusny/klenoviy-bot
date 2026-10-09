@@ -180,7 +180,6 @@ async def strip_buttons(bot, chat_id: int, message_id: int) -> None:
 
 
 TOTAL_STEPS = 3
-APPEAL_STEPS = 1
 
 
 def _bar(done: int, total: int = TOTAL_STEPS) -> str:
