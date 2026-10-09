@@ -241,12 +241,13 @@ SCHEMA = """
 PRAGMA journal_mode=WAL;
 
 CREATE TABLE IF NOT EXISTS users (
-    user_id     INTEGER PRIMARY KEY,
-    username    TEXT,
-    first_name  TEXT,
-    state       TEXT NOT NULL DEFAULT 'new',
-    created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    user_id          INTEGER PRIMARY KEY,
+    username         TEXT,
+    first_name       TEXT,
+    state            TEXT NOT NULL DEFAULT 'new',
+    pre_appeal_state TEXT,
+    created_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE TABLE IF NOT EXISTS applications (
@@ -317,6 +318,10 @@ def _sync_init_db() -> None:
     with sqlite3.connect(DB_PATH) as conn:
         conn.executescript(SCHEMA)
 
+        u_cols = {row[1] for row in conn.execute("PRAGMA table_info(users)")}
+        if "pre_appeal_state" not in u_cols:
+            conn.execute("ALTER TABLE users ADD COLUMN pre_appeal_state TEXT")
+
         cols = {row[1] for row in conn.execute("PRAGMA table_info(applications)")}
         if "video_note_file_id" not in cols:
             conn.execute("ALTER TABLE applications ADD COLUMN video_note_file_id TEXT")
@@ -363,6 +368,13 @@ async def upsert_user(user_id: int, username: Optional[str], first_name: Optiona
 async def set_user_state(user_id: int, state: str) -> None:
     await db_exec(
         "UPDATE users SET state = ?, updated_at = CURRENT_TIMESTAMP WHERE user_id = ?",
+        (state, user_id),
+    )
+
+
+async def set_pre_appeal_state(user_id: int, state: Optional[str]) -> None:
+    await db_exec(
+        "UPDATE users SET pre_appeal_state = ?, updated_at = CURRENT_TIMESTAMP WHERE user_id = ?",
         (state, user_id),
     )
 
@@ -710,7 +722,10 @@ def appeal_decision_keyboard(appeal_id: int) -> InlineKeyboardMarkup:
         [
             InlineKeyboardButton("✅ Принять", callback_data=f"appeal_approve:{appeal_id}"),
             InlineKeyboardButton("❌ Отклонить", callback_data=f"appeal_reject:{appeal_id}"),
-        ]
+        ],
+        [
+            InlineKeyboardButton("🔁 Выдать новую ссылку", callback_data=f"appeal_newlink:{appeal_id}"),
+        ],
     ])
 
 
@@ -815,8 +830,7 @@ def _blocked_text(until_str: str) -> str:
     )
 
 
-async def _build_approved_text(bot, user_id: int) -> str:
-    link = None
+async def _generate_invite_link(bot, user_id: int) -> Optional[str]:
     expire_at = datetime.now(timezone.utc) + timedelta(hours=1)
 
     try:
@@ -830,21 +844,28 @@ async def _build_approved_text(bot, user_id: int) -> str:
         link = invite.invite_link
         await save_invite_link(user_id, link)
         log.info("Invite link created (limit+request) for %s: %s", user_id, link)
+        return link
     except Exception as e:
         log.warning("limit+request failed (%s), retry without member_limit", e)
-        try:
-            invite = await bot.create_chat_invite_link(
-                chat_id=TARGET_CHAT_ID,
-                creates_join_request=True,
-                expire_date=expire_at,
-                name=f"u{user_id}",
-            )
-            link = invite.invite_link
-            await save_invite_link(user_id, link)
-            log.info("Invite link created (request-only) for %s: %s", user_id, link)
-        except Exception as e2:
-            log.error("create_chat_invite_link failed for %s: %s", user_id, e2)
 
+    try:
+        invite = await bot.create_chat_invite_link(
+            chat_id=TARGET_CHAT_ID,
+            creates_join_request=True,
+            expire_date=expire_at,
+            name=f"u{user_id}",
+        )
+        link = invite.invite_link
+        await save_invite_link(user_id, link)
+        log.info("Invite link created (request-only) for %s: %s", user_id, link)
+        return link
+    except Exception as e2:
+        log.error("create_chat_invite_link failed for %s: %s", user_id, e2)
+        return None
+
+
+async def _build_approved_text(bot, user_id: int) -> str:
+    link = await _generate_invite_link(bot, user_id)
     if not link:
         link = CHAT_INVITE_LINK or "(ссылка недоступна, обратитесь к администрации)"
 
@@ -854,6 +875,18 @@ async def _build_approved_text(bot, user_id: int) -> str:
         "━━━━━━━━━━━━━━━━━━━━\n"
         "⚖️ Если в чате вы получили наказание и считаете его "
         "несправедливым — можете подать апелляцию кнопкой ниже."
+    )
+
+
+async def _build_new_link_text(bot, user_id: int) -> str:
+    link = await _generate_invite_link(bot, user_id)
+    if not link:
+        link = CHAT_INVITE_LINK or "(ссылка недоступна, обратитесь к администрации)"
+
+    return (
+        "🔁 <b>Вам выдана новая ссылка на чат</b>\n\n"
+        f"🔗 <b>Ссылка:</b> {link}\n\n"
+        "<i>Ссылка одноразовая, действует 1 час.</i>"
     )
 
 
@@ -1376,18 +1409,20 @@ def _render_decision_text(original_text: str, approved: bool, admin_username: st
     return f"{header}\n\n━━━━━━━━━━━━━━━━━━━━\n\n{original_text}"
 
 
-def _render_appeal_decision_text(original_text: str, approved: bool, admin_username: str) -> str:
-    if approved:
-        header = (
-            "✅ <b>АПЕЛЛЯЦИЯ ПРИНЯТА</b> ✅\n"
-            f"<i>Решение: @{esc(admin_username)}</i>"
-        )
+def _render_appeal_decision_text(original_text: str, status: str, admin_username: str) -> str:
+    if status == "approved":
+        header = "✅ <b>АПЕЛЛЯЦИЯ ПРИНЯТА</b> ✅"
+    elif status == "rejected":
+        header = "❌ <b>АПЕЛЛЯЦИЯ ОТКЛОНЕНА</b> ❌"
+    elif status == "new_link":
+        header = "🔁 <b>ВЫДАНА НОВАЯ ССЫЛКА</b>"
     else:
-        header = (
-            "❌ <b>АПЕЛЛЯЦИЯ ОТКЛОНЕНА</b> ❌\n"
-            f"<i>Решение: @{esc(admin_username)}</i>"
-        )
-    return f"{header}\n\n━━━━━━━━━━━━━━━━━━━━\n\n{original_text}"
+        header = "❓ <b>СТАТУС НЕИЗВЕСТЕН</b>"
+    return (
+        f"{header}\n"
+        f"<i>Решение: @{esc(admin_username)}</i>\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n\n{original_text}"
+    )
 
 
 async def _finalize_admin_message(bot, msg_id: Optional[int], original_text: str,
@@ -1418,11 +1453,11 @@ async def _finalize_admin_message(bot, msg_id: Optional[int], original_text: str
 
 
 async def _finalize_appeal_admin_message(bot, msg_id: Optional[int], original_text: str,
-                                         approved: bool, admin_username: str) -> None:
+                                         status: str, admin_username: str) -> None:
     if not msg_id:
         return
 
-    new_text = _render_appeal_decision_text(original_text, approved, admin_username)
+    new_text = _render_appeal_decision_text(original_text, status, admin_username)
 
     edited = await safe(
         bot.edit_message_text,
@@ -1571,10 +1606,12 @@ async def cb_appeal_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
         await safe(query.answer, "Заполни шаблон выше и отправь одним сообщением.", show_alert=True)
         return
 
-    if db_user["state"] not in ("rejected", "approved"):
+    current_state = db_user["state"]
+    if current_state not in ("rejected", "approved"):
         await safe(query.answer, "Апелляцию можно подать после рассмотрения заявки.", show_alert=True)
         return
 
+    await set_pre_appeal_state(user.id, current_state)
     await set_user_state(user.id, "awaiting_appeal_form")
 
     if query.message is not None:
@@ -1610,36 +1647,55 @@ async def cb_appeal_approve(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
         await safe(query.answer, "Апелляция уже обработана", show_alert=False)
         return
 
-    await remove_from_blacklist(target_user_id)
-    await set_user_state(target_user_id, "awaiting_form")
+    target_user = await get_user(target_user_id)
+    prev_state = target_user["pre_appeal_state"] if target_user else None
 
-    await safe(
-        ctx.bot.send_message,
-        chat_id=target_user_id,
-        text=(
-            "✅ <b>Апелляция одобрена</b>\n\n"
-            "Вы можете повторно заполнить анкету.\n"
-            "Шаблон — ниже 👇"
-        ),
-        parse_mode=ParseMode.HTML,
-    )
-    await safe(
-        ctx.bot.send_message,
-        chat_id=target_user_id,
-        text=FORM_TEXT,
-        parse_mode=ParseMode.HTML,
-    )
+    await remove_from_blacklist(target_user_id)
+    await set_pre_appeal_state(target_user_id, None)
+
+    if prev_state == "approved":
+        await set_user_state(target_user_id, "approved")
+        await safe(
+            ctx.bot.send_message,
+            chat_id=target_user_id,
+            text=(
+                "✅ <b>Апелляция одобрена</b>\n\n"
+                "С вас <b>будут сняты все ограничения</b>. Спасибо за понимание 🍁"
+            ),
+            parse_mode=ParseMode.HTML,
+        )
+        log.info("Appeal %s approved: user %s was already in chat, restrictions lifted",
+                 appeal_id, target_user_id)
+    else:
+        await set_user_state(target_user_id, "awaiting_form")
+        await safe(
+            ctx.bot.send_message,
+            chat_id=target_user_id,
+            text=(
+                "✅ <b>Апелляция одобрена</b>\n\n"
+                "Вы можете повторно заполнить анкету.\n"
+                "Шаблон — ниже 👇"
+            ),
+            parse_mode=ParseMode.HTML,
+        )
+        await safe(
+            ctx.bot.send_message,
+            chat_id=target_user_id,
+            text=FORM_TEXT,
+            parse_mode=ParseMode.HTML,
+        )
+        log.info("Appeal %s approved: user %s was rejected, sent form",
+                 appeal_id, target_user_id)
 
     admin_username = user.username or user.full_name
     await _finalize_appeal_admin_message(
         ctx.bot,
         appeal_row["admin_msg_id"],
         query.message.text or query.message.caption or "",
-        approved=True,
+        status="approved",
         admin_username=admin_username,
     )
     await safe(query.answer, "Апелляция принята")
-    log.info("Appeal %s approved by %s (user %s)", appeal_id, user.id, target_user_id)
 
 
 async def cb_appeal_reject(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1671,13 +1727,14 @@ async def cb_appeal_reject(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
     until_str = _future_utc_str(APPEAL_BLOCK_DAYS)
 
     await add_to_blacklist(target_user_id, reason="appeal_rejected", expires_at=until_str)
+    await set_pre_appeal_state(target_user_id, None)
     await set_user_state(target_user_id, "rejected")
 
     await safe(
         ctx.bot.send_message,
         chat_id=target_user_id,
         text=(
-            "❌ <b>Апелляция отклонена</b>\n\n"
+            "❌ <b>В апелляции отказано</b>\n\n"
             f"Вы не можете подать апелляцию в течение {APPEAL_BLOCK_DAYS} дней.\n\n"
             f"🕒 <b>Блокировка снимется:</b> {_pretty_dt(until_str)}"
         ),
@@ -1689,12 +1746,63 @@ async def cb_appeal_reject(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
         ctx.bot,
         appeal_row["admin_msg_id"],
         query.message.text or query.message.caption or "",
-        approved=False,
+        status="rejected",
         admin_username=admin_username,
     )
     await safe(query.answer, "Апелляция отклонена")
     log.info("Appeal %s rejected by %s (user %s, blocked until %s)",
              appeal_id, user.id, target_user_id, until_str)
+
+
+async def cb_appeal_newlink(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    user = update.effective_user
+    if query is None or user is None or query.message is None:
+        return
+
+    if query.message.chat_id != ADMIN_CHAT_ID:
+        await safe(query.answer, "Недоступно", show_alert=False)
+        return
+    if not await _is_admin(ctx.bot, ADMIN_CHAT_ID, user.id):
+        await safe(query.answer, "Только для администраторов", show_alert=True)
+        return
+
+    appeal_id = int(query.data.split(":", 1)[1])
+    appeal_row = await get_appeal(appeal_id)
+    if not appeal_row:
+        await safe(query.answer, "Апелляция не найдена", show_alert=True)
+        return
+
+    target_user_id = appeal_row["user_id"]
+
+    won = await try_decide_appeal(appeal_id, "new_link", user.id)
+    if not won:
+        await safe(query.answer, "Апелляция уже обработана", show_alert=False)
+        return
+
+    await remove_from_blacklist(target_user_id)
+    await set_pre_appeal_state(target_user_id, None)
+    await set_user_state(target_user_id, "approved")
+
+    new_link_text = await _build_new_link_text(ctx.bot, target_user_id)
+    await safe(
+        ctx.bot.send_message,
+        chat_id=target_user_id,
+        text=new_link_text,
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
+    )
+
+    admin_username = user.username or user.full_name
+    await _finalize_appeal_admin_message(
+        ctx.bot,
+        appeal_row["admin_msg_id"],
+        query.message.text or query.message.caption or "",
+        status="new_link",
+        admin_username=admin_username,
+    )
+    await safe(query.answer, "Ссылка отправлена")
+    log.info("Appeal %s: new link sent to user %s by %s", appeal_id, target_user_id, user.id)
 
 
 async def cmd_unban(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1768,6 +1876,7 @@ async def _build_app() -> Application:
     app.add_handler(CallbackQueryHandler(cb_reject,  pattern=r"^reject:"))
     app.add_handler(CallbackQueryHandler(cb_appeal_approve, pattern=r"^appeal_approve:"))
     app.add_handler(CallbackQueryHandler(cb_appeal_reject,  pattern=r"^appeal_reject:"))
+    app.add_handler(CallbackQueryHandler(cb_appeal_newlink, pattern=r"^appeal_newlink:"))
     app.add_handler(CallbackQueryHandler(cb_ping_admins, pattern=r"^ping_admins$"))
     app.add_handler(CallbackQueryHandler(cb_agree,   pattern=r"^agree$"))
     app.add_handler(CallbackQueryHandler(cb_refuse,  pattern=r"^refuse$"))
