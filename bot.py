@@ -16,6 +16,7 @@ _ensure("python-dotenv", "dotenv")
 import os
 from pathlib import Path
 from typing import Optional
+from datetime import datetime, timedelta
 
 from dotenv import load_dotenv
 
@@ -71,6 +72,7 @@ CHAT_INVITE_LINK = _req("CHAT_INVITE_LINK")
 RULES_LINK       = _req("RULES_LINK")
 
 TOPIC_THREAD_ID: Optional[int] = _opt_int("TOPIC_THREAD_ID", None)
+APPEAL_THREAD_ID: Optional[int] = _opt_int("APPEAL_THREAD_ID", 3854)
 DB_PATH = _opt("DB_PATH", "bot.db")
 
 THROTTLE_SECONDS      = _opt_float("THROTTLE_SECONDS", 2.0)
@@ -80,6 +82,7 @@ READ_TIMEOUT          = _opt_float("READ_TIMEOUT", 30.0)
 WRITE_TIMEOUT         = _opt_float("WRITE_TIMEOUT", 30.0)
 POOL_TIMEOUT          = _opt_float("POOL_TIMEOUT", 30.0)
 START_RETRY_DELAY     = _opt_float("START_RETRY_DELAY", 10.0)
+APPEAL_COOLDOWN_DAYS  = _opt_int("APPEAL_COOLDOWN_DAYS", 14) or 14
 
 
 import asyncio
@@ -127,8 +130,8 @@ if not log.handlers:
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
-log.info("Config loaded | cwd=%s | admin_chat=%s | thread=%s",
-         Path.cwd(), ADMIN_CHAT_ID, TOPIC_THREAD_ID)
+log.info("Config loaded | cwd=%s | admin_chat=%s | thread=%s | appeal_thread=%s",
+         Path.cwd(), ADMIN_CHAT_ID, TOPIC_THREAD_ID, APPEAL_THREAD_ID)
 
 
 def esc(value) -> str:
@@ -157,6 +160,12 @@ def _topic_kwargs() -> dict:
     return {}
 
 
+def _appeal_kwargs() -> dict:
+    if APPEAL_THREAD_ID:
+        return {"message_thread_id": APPEAL_THREAD_ID}
+    return {}
+
+
 async def send_msg(bot, chat_id: int, *, text: str, **kwargs):
     return await safe(bot.send_message, chat_id=chat_id, text=text, **kwargs)
 
@@ -171,6 +180,7 @@ async def strip_buttons(bot, chat_id: int, message_id: int) -> None:
 
 
 TOTAL_STEPS = 3
+APPEAL_STEPS = 1
 
 
 def _bar(done: int, total: int = TOTAL_STEPS) -> str:
@@ -254,8 +264,29 @@ CREATE INDEX IF NOT EXISTS idx_applications_user_status
 CREATE TABLE IF NOT EXISTS blacklist (
     user_id     INTEGER PRIMARY KEY,
     reason      TEXT,
-    blocked_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    blocked_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    unblock_at  TIMESTAMP
 );
+
+CREATE TABLE IF NOT EXISTS appeals (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id               INTEGER NOT NULL,
+    username_at_submit    TEXT,
+    first_name_at_submit  TEXT,
+    name                  TEXT NOT NULL,
+    age                   TEXT NOT NULL,
+    punishment_type       TEXT NOT NULL,
+    description           TEXT NOT NULL,
+    status                TEXT NOT NULL DEFAULT 'pending',
+    admin_msg_id          INTEGER,
+    related_app_id        INTEGER,
+    created_at            TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    decided_by            INTEGER,
+    decided_at            TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_appeals_user_status
+    ON appeals (user_id, status);
 """
 
 
@@ -268,6 +299,10 @@ def _sync_init_db() -> None:
             conn.execute("ALTER TABLE applications ADD COLUMN video_note_file_id TEXT")
         if "video_admin_msg_id" not in cols:
             conn.execute("ALTER TABLE applications ADD COLUMN video_admin_msg_id INTEGER")
+
+        bl_cols = {row[1] for row in conn.execute("PRAGMA table_info(blacklist)")}
+        if "unblock_at" not in bl_cols:
+            conn.execute("ALTER TABLE blacklist ADD COLUMN unblock_at TIMESTAMP")
 
         conn.commit()
 
@@ -314,18 +349,37 @@ async def get_user(user_id: int):
 
 
 async def is_blacklisted(user_id: int) -> bool:
-    row = await db_exec("SELECT 1 FROM blacklist WHERE user_id = ?", (user_id,), fetch="one")
-    return row is not None
+    row = await db_exec(
+        "SELECT reason, unblock_at FROM blacklist WHERE user_id = ?",
+        (user_id,), fetch="one",
+    )
+    if row is None:
+        return False
+    if row["unblock_at"]:
+        try:
+            unblock = datetime.fromisoformat(row["unblock_at"])
+            if datetime.utcnow() >= unblock:
+                await remove_from_blacklist(user_id)
+                return False
+        except Exception:
+            pass
+    return True
 
 
-async def add_to_blacklist(user_id: int, reason: str) -> None:
+async def add_to_blacklist(user_id: int, reason: str, days: Optional[int] = None) -> None:
+    unblock_at = None
+    if days is not None and days > 0:
+        unblock_at = (datetime.utcnow() + timedelta(days=days)).isoformat()
     await db_exec(
         """
-        INSERT INTO blacklist (user_id, reason, blocked_at)
-        VALUES (?, ?, CURRENT_TIMESTAMP)
-        ON CONFLICT(user_id) DO UPDATE SET reason = excluded.reason
+        INSERT INTO blacklist (user_id, reason, blocked_at, unblock_at)
+        VALUES (?, ?, CURRENT_TIMESTAMP, ?)
+        ON CONFLICT(user_id) DO UPDATE SET
+            reason = excluded.reason,
+            blocked_at = CURRENT_TIMESTAMP,
+            unblock_at = excluded.unblock_at
         """,
-        (user_id, reason),
+        (user_id, reason, unblock_at),
     )
 
 
@@ -345,9 +399,24 @@ async def has_active_application(user_id: int) -> bool:
     return row is not None
 
 
+async def has_active_appeal(user_id: int) -> bool:
+    row = await db_exec(
+        "SELECT 1 FROM appeals WHERE user_id = ? AND status = 'pending'",
+        (user_id,), fetch="one",
+    )
+    return row is not None
+
+
 async def get_latest_application(user_id: int):
     return await db_exec(
         "SELECT * FROM applications WHERE user_id = ? ORDER BY id DESC LIMIT 1",
+        (user_id,), fetch="one",
+    )
+
+
+async def get_latest_appeal(user_id: int):
+    return await db_exec(
+        "SELECT * FROM appeals WHERE user_id = ? ORDER BY id DESC LIMIT 1",
         (user_id,), fetch="one",
     )
 
@@ -371,8 +440,31 @@ async def create_application(
     )
 
 
+async def create_appeal(
+    user_id: int,
+    username_at_submit: Optional[str],
+    first_name_at_submit: Optional[str],
+    name: str, age: str, punishment_type: str, description: str,
+    related_app_id: Optional[int] = None,
+) -> int:
+    return await db_exec(
+        """
+        INSERT INTO appeals
+            (user_id, username_at_submit, first_name_at_submit,
+             name, age, punishment_type, description, status, related_app_id, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, CURRENT_TIMESTAMP)
+        """,
+        (user_id, username_at_submit, first_name_at_submit,
+         name, age, punishment_type, description, related_app_id),
+    )
+
+
 async def get_application(app_id: int):
     return await db_exec("SELECT * FROM applications WHERE id = ?", (app_id,), fetch="one")
+
+
+async def get_appeal(appeal_id: int):
+    return await db_exec("SELECT * FROM appeals WHERE id = ?", (appeal_id,), fetch="one")
 
 
 async def set_application_status(app_id: int, status: str) -> None:
@@ -391,6 +483,10 @@ async def set_video_admin_msg_id(app_id: int, msg_id: int) -> None:
     await db_exec("UPDATE applications SET video_admin_msg_id = ? WHERE id = ?", (msg_id, app_id))
 
 
+async def set_appeal_admin_msg_id(appeal_id: int, msg_id: int) -> None:
+    await db_exec("UPDATE appeals SET admin_msg_id = ? WHERE id = ?", (msg_id, appeal_id))
+
+
 async def decide_application(app_id: int, status: str, decided_by: int) -> None:
     await db_exec(
         """
@@ -399,6 +495,17 @@ async def decide_application(app_id: int, status: str, decided_by: int) -> None:
         WHERE id = ?
         """,
         (status, decided_by, app_id),
+    )
+
+
+async def decide_appeal(appeal_id: int, status: str, decided_by: int) -> None:
+    await db_exec(
+        """
+        UPDATE appeals
+        SET status = ?, decided_by = ?, decided_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+        """,
+        (status, decided_by, appeal_id),
     )
 
 
@@ -412,6 +519,15 @@ FIELD_PATTERNS = {
     "about":    r"о\s+себе(?:\s+по\s+желанию)?",
 }
 
+APPEAL_REQUIRED = ("name", "age", "punishment_type", "description")
+
+APPEAL_FIELD_PATTERNS = {
+    "name":             r"имя",
+    "age":              r"возраст",
+    "punishment_type":  r"тип\s+наказания",
+    "description":      r"описание",
+}
+
 
 @dataclass
 class ParsedForm:
@@ -420,6 +536,14 @@ class ParsedForm:
     diseases: str
     reason: str
     about: Optional[str]
+
+
+@dataclass
+class ParsedAppeal:
+    name: str
+    age: str
+    punishment_type: str
+    description: str
 
 
 def parse_form(text: str) -> Optional[ParsedForm]:
@@ -467,6 +591,50 @@ def parse_form(text: str) -> Optional[ParsedForm]:
     )
 
 
+def parse_appeal(text: str) -> Optional[ParsedAppeal]:
+    if not text:
+        return None
+
+    lines = [ln.rstrip() for ln in text.replace("\r", "").split("\n")]
+    collected: dict[str, str] = {}
+    current_key: Optional[str] = None
+
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line:
+            if current_key and current_key in collected:
+                collected[current_key] += "\n"
+            continue
+
+        matched_key = None
+        matched_value = ""
+        if ":" in line:
+            head, _, tail = line.partition(":")
+            head_norm = head.strip().lower()
+            for key, pattern in APPEAL_FIELD_PATTERNS.items():
+                if re.fullmatch(pattern, head_norm, flags=re.IGNORECASE):
+                    matched_key = key
+                    matched_value = tail.strip()
+                    break
+
+        if matched_key:
+            collected[matched_key] = matched_value
+            current_key = matched_key
+        elif current_key:
+            collected[current_key] = (collected.get(current_key, "") + " " + line).strip()
+
+    for key in APPEAL_REQUIRED:
+        if not collected.get(key, "").strip():
+            return None
+
+    return ParsedAppeal(
+        name=collected["name"].strip(),
+        age=collected["age"].strip(),
+        punishment_type=collected["punishment_type"].strip(),
+        description=collected["description"].strip(),
+    )
+
+
 _last_seen: dict[int, float] = defaultdict(float)
 _last_ping: dict[int, float] = defaultdict(float)
 
@@ -511,9 +679,24 @@ def decision_keyboard(application_id: int) -> InlineKeyboardMarkup:
     ])
 
 
+def appeal_decision_keyboard(appeal_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ Принять", callback_data=f"appeal_approve:{appeal_id}"),
+            InlineKeyboardButton("❌ Отклонить", callback_data=f"appeal_reject:{appeal_id}"),
+        ]
+    ])
+
+
 def waiting_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📣 Упомянуть администрацию", callback_data="ping_admins")],
+    ])
+
+
+def appeal_offer_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📝 Подать апелляцию", callback_data="start_appeal")],
     ])
 
 
@@ -572,6 +755,33 @@ WAITING_TEXT = (
     "Если ответа нет долго — нажмите кнопку ниже, чтобы привлечь внимание."
 )
 
+APPEAL_FORM_TEXT = (
+    "📝 <b>Апелляция</b>\n\n"
+    "Скопируйте шаблон ниже — <i>тап по блоку = копирование</i>.\n"
+    "Заполните все поля и отправьте <b>одним сообщением</b>.\n\n"
+    "━━━━━━━━━━━━━━━━━━━━\n"
+    "<pre>"
+    "Имя: \n"
+    "Возраст: \n"
+    "Тип наказания: \n"
+    "Описание: "
+    "</pre>\n"
+    "━━━━━━━━━━━━━━━━━━━━\n\n"
+    "<i>Обязательные поля: Имя, Возраст, Тип наказания, Описание.</i>"
+)
+
+INVALID_APPEAL_TEXT = (
+    "❌ <b>Апелляция оформлена не по шаблону</b>\n\n"
+    "Скопируйте шаблон из сообщения выше, заполните все обязательные поля "
+    "и отправьте <b>одним сообщением</b>.\n\n"
+    "Обязательные: <b>Имя</b>, <b>Возраст</b>, <b>Тип наказания</b>, <b>Описание</b>."
+)
+
+APPEAL_WAITING_TEXT = (
+    "⏳ <b>Апелляция на рассмотрении</b>\n\n"
+    "Ожидайте — администрация изучает вашу апелляцию."
+)
+
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
@@ -589,7 +799,34 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     db_user = await get_user(user.id)
 
+    if db_user and db_user["state"] == "awaiting_appeal":
+        await send_msg(
+            ctx.bot, user.id,
+            text=APPEAL_FORM_TEXT,
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    if db_user and db_user["state"] == "appeal_pending":
+        await send_msg(
+            ctx.bot, user.id,
+            text=APPEAL_WAITING_TEXT,
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
     if db_user and db_user["state"] in ("approved", "rejected"):
+        latest = await get_latest_application(user.id)
+        if latest and latest["status"] in ("approved", "rejected"):
+            await send_msg(
+                ctx.bot, user.id,
+                text=(
+                    "Ваша заявка уже рассмотрена.\n\n"
+                    "Вы можете подать апелляцию:"
+                ),
+                parse_mode=ParseMode.HTML,
+                reply_markup=appeal_offer_keyboard(),
+            )
         return
 
     if db_user and db_user["state"] == "awaiting_video":
@@ -662,6 +899,38 @@ async def cb_agree(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await send_msg(
         ctx.bot, user.id,
         text=FORM_TEXT,
+        parse_mode=ParseMode.HTML,
+    )
+    await safe(query.answer)
+
+
+async def cb_start_appeal(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    user = update.effective_user
+    if query is None or user is None:
+        return
+
+    if await is_blacklisted(user.id):
+        await safe(query.answer, "Доступ ограничен.", show_alert=True)
+        return
+
+    if await has_active_appeal(user.id):
+        await safe(query.answer, "Апелляция уже на рассмотрении.", show_alert=True)
+        return
+
+    db_user = await get_user(user.id)
+    if not db_user or db_user["state"] not in ("approved", "rejected"):
+        await safe(query.answer, "Сейчас нельзя подать апелляцию.", show_alert=True)
+        return
+
+    await set_user_state(user.id, "awaiting_appeal")
+
+    if query.message is not None:
+        await strip_buttons(ctx.bot, user.id, query.message.message_id)
+
+    await send_msg(
+        ctx.bot, user.id,
+        text=APPEAL_FORM_TEXT,
         parse_mode=ParseMode.HTML,
     )
     await safe(query.answer)
@@ -749,6 +1018,33 @@ def _build_admin_text(app_row, tg_user) -> str:
     )
 
 
+def _build_appeal_admin_text(appeal_row, tg_user) -> str:
+    username = tg_user.username
+    user_id = tg_user.id
+    first_name = tg_user.first_name or "—"
+
+    username_display = f"@{esc(username)}" if username else "без username"
+    mention = f'<a href="tg://user?id={user_id}">{esc(first_name)}</a>'
+
+    related = f"#{appeal_row['related_app_id']}" if appeal_row["related_app_id"] else "—"
+
+    return (
+        "📩 <b>Новая апелляция</b>\n\n"
+        f"👤 <b>Отправитель:</b> {username_display}\n"
+        f"🆔 <b>user_id:</b> <code>{user_id}</code>\n"
+        f"🔗 <b>Профиль:</b> {mention}\n"
+        f"📋 <b>Связанная заявка:</b> {related}\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "📝 <b>Апелляция:</b>\n\n"
+        f"<b>Имя:</b> {esc(appeal_row['name'])}\n"
+        f"<b>Возраст:</b> {esc(appeal_row['age'])}\n"
+        f"<b>Тип наказания:</b> {esc(appeal_row['punishment_type'])}\n"
+        f"<b>Описание:</b> {esc(appeal_row['description'])}\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        f"🕒 <b>Отправлено:</b> {appeal_row['created_at']}"
+    )
+
+
 async def on_user_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
     user = update.effective_user
@@ -770,7 +1066,67 @@ async def on_user_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     state = db_user["state"]
 
-    if state in ("rejected", "approved"):
+    if state == "awaiting_appeal":
+        if await has_active_appeal(user.id):
+            await set_user_state(user.id, "appeal_pending")
+            await send_msg(
+                ctx.bot, user.id,
+                text=APPEAL_WAITING_TEXT,
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        parsed = parse_appeal(message.text)
+        if parsed is None:
+            await send_msg(
+                ctx.bot, user.id,
+                text=INVALID_APPEAL_TEXT,
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        latest_app = await get_latest_application(user.id)
+        related_id = latest_app["id"] if latest_app else None
+
+        appeal_id = await create_appeal(
+            user_id=user.id,
+            username_at_submit=user.username,
+            first_name_at_submit=user.first_name,
+            name=parsed.name,
+            age=parsed.age,
+            punishment_type=parsed.punishment_type,
+            description=parsed.description,
+            related_app_id=related_id,
+        )
+        await set_user_state(user.id, "appeal_pending")
+
+        await send_msg(
+            ctx.bot, user.id,
+            text=APPEAL_WAITING_TEXT,
+            parse_mode=ParseMode.HTML,
+        )
+
+        appeal_row = await get_appeal(appeal_id)
+        admin_text = _build_appeal_admin_text(appeal_row, user)
+        admin_msg = await safe(
+            ctx.bot.send_message,
+            chat_id=ADMIN_CHAT_ID,
+            text=admin_text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=appeal_decision_keyboard(appeal_id),
+            disable_web_page_preview=True,
+            **_appeal_kwargs(),
+        )
+        if admin_msg is not None:
+            await set_appeal_admin_msg_id(appeal_id, admin_msg.message_id)
+        else:
+            log.warning("Appeal %s — не доставлено в ветку апелляций", appeal_id)
+
+        log.info("Appeal %s from user %s submitted to thread %s",
+                 appeal_id, user.id, APPEAL_THREAD_ID)
+        return
+
+    if state in ("rejected", "approved", "appeal_pending"):
         return
 
     if state == "awaiting_video":
@@ -913,6 +1269,20 @@ def _render_decision_text(original_text: str, approved: bool, admin_username: st
     return f"{header}\n\n━━━━━━━━━━━━━━━━━━━━\n\n{original_text}"
 
 
+def _render_appeal_decision_text(original_text: str, approved: bool, admin_username: str) -> str:
+    if approved:
+        header = (
+            "✅ <b>АПЕЛЛЯЦИЯ ПРИНЯТА</b> ✅\n"
+            f"<i>Решение: @{esc(admin_username)}</i>"
+        )
+    else:
+        header = (
+            "❌ <b>АПЕЛЛЯЦИЯ ОТКЛОНЕНА</b> ❌\n"
+            f"<i>Решение: @{esc(admin_username)}</i>"
+        )
+    return f"{header}\n\n━━━━━━━━━━━━━━━━━━━━\n\n{original_text}"
+
+
 async def _finalize_admin_message(bot, msg_id: Optional[int], original_text: str,
                                   approved: bool, admin_username: str) -> None:
     if not msg_id:
@@ -940,14 +1310,74 @@ async def _finalize_admin_message(bot, msg_id: Optional[int], original_text: str
     )
 
 
+async def _finalize_appeal_message(bot, msg_id: Optional[int], original_text: str,
+                                   approved: bool, admin_username: str) -> None:
+    if not msg_id:
+        return
+
+    new_text = _render_appeal_decision_text(original_text, approved, admin_username)
+
+    edited = await safe(
+        bot.edit_message_text,
+        chat_id=ADMIN_CHAT_ID,
+        message_id=msg_id,
+        text=new_text,
+        parse_mode=ParseMode.HTML,
+        reply_markup=None,
+        disable_web_page_preview=True,
+    )
+    if edited is not None:
+        return
+
+    await safe(
+        bot.edit_message_reply_markup,
+        chat_id=ADMIN_CHAT_ID,
+        message_id=msg_id,
+        reply_markup=None,
+    )
+
+
 async def _notify_user_decision(bot, user_id: int, approved: bool) -> None:
     if approved:
         text = (
             "🎉 Вашу заявку <b>приняли</b>, добро пожаловать 🍁\n\n"
             f"Ссылка на чат: {CHAT_INVITE_LINK}"
         )
+        kb = None
     else:
-        text = "❌ Вашу заявку <b>отклонили</b>. Доступ к боту закрыт."
+        text = (
+            "❌ Вашу заявку <b>отклонили</b>.\n\n"
+            "Вы можете подать апелляцию:"
+        )
+        kb = appeal_offer_keyboard()
+
+    await safe(
+        bot.send_message,
+        chat_id=user_id,
+        text=text,
+        parse_mode=ParseMode.HTML,
+        reply_markup=kb,
+        disable_web_page_preview=True,
+    )
+
+
+async def _notify_user_appeal_decision(bot, user_id: int, approved: bool) -> None:
+    if approved:
+        text = (
+            "✅ Вашу апелляцию <b>приняли</b>.\n\n"
+            "Вы можете заполнить анкету повторно.\n"
+            "Нажмите /start"
+        )
+        await remove_from_blacklist(user_id)
+        await set_user_state(user_id, "new")
+    else:
+        text = (
+            f"❌ Вашу апелляцию <b>отклонили</b>.\n\n"
+            f"Повторно подать апелляцию можно через {APPEAL_COOLDOWN_DAYS} дней.\n"
+            f"Доступ к боту ограничен на {APPEAL_COOLDOWN_DAYS} дней."
+        )
+        await add_to_blacklist(user_id, reason="appeal_rejected", days=APPEAL_COOLDOWN_DAYS)
+        await set_user_state(user_id, "rejected")
 
     await safe(
         bot.send_message,
@@ -1037,6 +1467,80 @@ async def cb_reject(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     log.info("App %s rejected by %s", app_id, user.id)
 
 
+async def cb_appeal_approve(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    user = update.effective_user
+    if query is None or user is None or query.message is None:
+        return
+
+    if query.message.chat_id != ADMIN_CHAT_ID:
+        await safe(query.answer, "Недоступно", show_alert=False)
+        return
+    if not await _is_admin(ctx.bot, ADMIN_CHAT_ID, user.id):
+        await safe(query.answer, "Только для администраторов", show_alert=True)
+        return
+
+    appeal_id = int(query.data.split(":", 1)[1])
+    appeal_row = await get_appeal(appeal_id)
+    if not appeal_row:
+        await safe(query.answer, "Апелляция не найдена", show_alert=True)
+        return
+    if appeal_row["status"] != "pending":
+        await safe(query.answer, "Апелляция уже обработана", show_alert=False)
+        return
+
+    await decide_appeal(appeal_id, "approved", user.id)
+    await _notify_user_appeal_decision(ctx.bot, appeal_row["user_id"], approved=True)
+
+    admin_username = user.username or user.full_name
+    await _finalize_appeal_message(
+        ctx.bot,
+        appeal_row["admin_msg_id"],
+        query.message.text or query.message.caption or "",
+        approved=True,
+        admin_username=admin_username,
+    )
+    await safe(query.answer, "Апелляция принята")
+    log.info("Appeal %s approved by %s", appeal_id, user.id)
+
+
+async def cb_appeal_reject(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    user = update.effective_user
+    if query is None or user is None or query.message is None:
+        return
+
+    if query.message.chat_id != ADMIN_CHAT_ID:
+        await safe(query.answer, "Недоступно", show_alert=False)
+        return
+    if not await _is_admin(ctx.bot, ADMIN_CHAT_ID, user.id):
+        await safe(query.answer, "Только для администраторов", show_alert=True)
+        return
+
+    appeal_id = int(query.data.split(":", 1)[1])
+    appeal_row = await get_appeal(appeal_id)
+    if not appeal_row:
+        await safe(query.answer, "Апелляция не найдена", show_alert=True)
+        return
+    if appeal_row["status"] != "pending":
+        await safe(query.answer, "Апелляция уже обработана", show_alert=False)
+        return
+
+    await decide_appeal(appeal_id, "rejected", user.id)
+    await _notify_user_appeal_decision(ctx.bot, appeal_row["user_id"], approved=False)
+
+    admin_username = user.username or user.full_name
+    await _finalize_appeal_message(
+        ctx.bot,
+        appeal_row["admin_msg_id"],
+        query.message.text or query.message.caption or "",
+        approved=False,
+        admin_username=admin_username,
+    )
+    await safe(query.answer, "Апелляция отклонена")
+    log.info("Appeal %s rejected by %s", appeal_id, user.id)
+
+
 async def cmd_unban(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
     user = update.effective_user
@@ -1104,6 +1608,9 @@ async def _build_app() -> Application:
 
     app.add_handler(CallbackQueryHandler(cb_approve, pattern=r"^approve:"))
     app.add_handler(CallbackQueryHandler(cb_reject,  pattern=r"^reject:"))
+    app.add_handler(CallbackQueryHandler(cb_appeal_approve, pattern=r"^appeal_approve:"))
+    app.add_handler(CallbackQueryHandler(cb_appeal_reject,  pattern=r"^appeal_reject:"))
+    app.add_handler(CallbackQueryHandler(cb_start_appeal, pattern=r"^start_appeal$"))
     app.add_handler(CallbackQueryHandler(cb_ping_admins, pattern=r"^ping_admins$"))
     app.add_handler(CallbackQueryHandler(cb_agree,   pattern=r"^agree$"))
     app.add_handler(CallbackQueryHandler(cb_refuse,  pattern=r"^refuse$"))
@@ -1123,7 +1630,7 @@ async def _build_app() -> Application:
     ))
 
     app.add_handler(MessageHandler(
-        filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE,
+        filters.TEXT & \~filters.COMMAND & filters.ChatType.PRIVATE,
         on_user_text,
     ))
     app.add_error_handler(_error_handler)
@@ -1140,7 +1647,8 @@ async def _start_with_retry() -> Application:
             await app.initialize()
             await app.start()
             await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
-            log.info("Bot running. Thread: %s. Ctrl+C to stop.", TOPIC_THREAD_ID)
+            log.info("Bot running. Thread: %s | Appeal thread: %s. Ctrl+C to stop.",
+                     TOPIC_THREAD_ID, APPEAL_THREAD_ID)
             return app
         except (TimedOut, NetworkError) as e:
             log.warning("Сеть недоступна (%s). Жду %.0f сек…",
