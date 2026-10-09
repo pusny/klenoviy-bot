@@ -425,6 +425,21 @@ async def remove_from_blacklist(user_id: int) -> None:
     )
 
 
+async def remove_permanent_blacklist(user_id: int) -> bool:
+    row = await db_exec(
+        "SELECT 1 FROM blacklist WHERE user_id = ? AND expires_at IS NULL",
+        (user_id,), fetch="one",
+    )
+    if row is None:
+        return False
+    await db_exec("DELETE FROM blacklist WHERE user_id = ? AND expires_at IS NULL", (user_id,))
+    await db_exec(
+        "UPDATE users SET state = 'new', updated_at = CURRENT_TIMESTAMP WHERE user_id = ?",
+        (user_id,),
+    )
+    return True
+
+
 async def has_active_application(user_id: int) -> bool:
     row = await db_exec(
         "SELECT 1 FROM applications WHERE user_id = ? AND status IN ('pending', 'awaiting_video')",
@@ -826,7 +841,8 @@ def _blocked_text(until_str: str) -> str:
     return (
         "🚫 <b>Доступ заблокирован</b>\n\n"
         f"Вы не можете подать апелляцию в течение {APPEAL_BLOCK_DAYS} дней.\n\n"
-        f"🕒 <b>Блокировка снимется:</b> {until_str}"
+        f"🕒 <b>Блокировка снимется:</b> {until_str}\n\n"
+        "<i>Когда срок истечёт — напишите /start, чтобы подать апелляцию снова.</i>"
     )
 
 
@@ -886,7 +902,8 @@ async def _build_new_link_text(bot, user_id: int) -> str:
     return (
         "🔁 <b>Вам выдана новая ссылка на чат</b>\n\n"
         f"🔗 <b>Ссылка:</b> {link}\n\n"
-        "<i>Ссылка одноразовая, действует 1 час.</i>"
+        "<i>Ссылка одноразовая, действует 1 час.</i>\n\n"
+        "<i>Чтобы подать апелляцию снова — напишите /start.</i>"
     )
 
 
@@ -1660,7 +1677,8 @@ async def cb_appeal_approve(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
             chat_id=target_user_id,
             text=(
                 "✅ <b>Апелляция одобрена</b>\n\n"
-                "С вас <b>будут сняты все ограничения</b>. Спасибо за понимание 🍁"
+                "С вас <b>будут сняты все ограничения</b>. Спасибо за понимание 🍁\n\n"
+                "<i>Чтобы подать апелляцию снова — напишите /start.</i>"
             ),
             parse_mode=ParseMode.HTML,
         )
@@ -1736,7 +1754,8 @@ async def cb_appeal_reject(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
         text=(
             "❌ <b>В апелляции отказано</b>\n\n"
             f"Вы не можете подать апелляцию в течение {APPEAL_BLOCK_DAYS} дней.\n\n"
-            f"🕒 <b>Блокировка снимется:</b> {_pretty_dt(until_str)}"
+            f"🕒 <b>Блокировка снимется:</b> {_pretty_dt(until_str)}\n\n"
+            "<i>Когда срок истечёт — напишите /start, чтобы подать апелляцию снова.</i>"
         ),
         parse_mode=ParseMode.HTML,
     )
@@ -1805,7 +1824,7 @@ async def cb_appeal_newlink(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
     log.info("Appeal %s: new link sent to user %s by %s", appeal_id, target_user_id, user.id)
 
 
-async def cmd_unban(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+async def cmd_untimeban(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
     user = update.effective_user
     if message is None or user is None:
@@ -1819,7 +1838,7 @@ async def cmd_unban(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if len(parts) < 2 or not parts[1].lstrip("-").isdigit():
         await safe(
             message.reply_text,
-            "Использование: /unban &lt;user_id&gt;",
+            "Использование: /untimeban &lt;user_id&gt;",
             parse_mode=ParseMode.HTML,
             **_topic_kwargs(),
         )
@@ -1829,11 +1848,46 @@ async def cmd_unban(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await remove_from_blacklist(target_id)
     await safe(
         message.reply_text,
-        f"Пользователь <code>{target_id}</code> разблокирован.",
+        f"Пользователь <code>{target_id}</code> разблокирован (временный бан снят).",
         parse_mode=ParseMode.HTML,
         **_topic_kwargs(),
     )
-    log.info("User %s unbanned by %s", target_id, user.id)
+    log.info("User %s untime-banned by %s", target_id, user.id)
+
+
+async def cmd_unperm(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    user = update.effective_user
+    if message is None or user is None:
+        return
+    if message.chat_id != ADMIN_CHAT_ID:
+        return
+    if not await _is_admin(ctx.bot, ADMIN_CHAT_ID, user.id):
+        return
+
+    parts = (message.text or "").split()
+    if len(parts) < 2 or not parts[1].lstrip("-").isdigit():
+        await safe(
+            message.reply_text,
+            "Использование: /unperm &lt;user_id&gt;",
+            parse_mode=ParseMode.HTML,
+            **_topic_kwargs(),
+        )
+        return
+
+    target_id = int(parts[1])
+    ok = await remove_permanent_blacklist(target_id)
+    if ok:
+        text = f"Пользователь <code>{target_id}</code> разблокирован (перманентный бан снят)."
+        log.info("User %s permanent-unbanned by %s", target_id, user.id)
+    else:
+        text = f"У пользователя <code>{target_id}</code> нет перманентного бана."
+    await safe(
+        message.reply_text,
+        text,
+        parse_mode=ParseMode.HTML,
+        **_topic_kwargs(),
+    )
 
 
 async def _post_init(app: Application) -> None:
@@ -1887,7 +1941,11 @@ async def _build_app() -> Application:
         filters=filters.ChatType.PRIVATE,
     ))
     app.add_handler(CommandHandler(
-        "unban", cmd_unban,
+        "untimeban", cmd_untimeban,
+        filters=filters.ChatType.PRIVATE,
+    ))
+    app.add_handler(CommandHandler(
+        "unperm", cmd_unperm,
         filters=filters.ChatType.PRIVATE,
     ))
 
