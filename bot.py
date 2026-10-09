@@ -185,16 +185,8 @@ async def strip_buttons(bot, chat_id: int, message_id: int) -> None:
 TOTAL_STEPS = 3
 
 
-def _bar(done: int, total: int = TOTAL_STEPS) -> str:
-    done = max(0, min(done, total))
-    return "▰" * done + "▱" * (total - done)
-
-
 def step_header(step: int, title: str) -> str:
-    return (
-        f"<b>Шаг {step}/{TOTAL_STEPS}</b> · <i>{title}</i>\n"
-        f"<code>{_bar(step)}</code>"
-    )
+    return f"<b>Шаг {step}/{TOTAL_STEPS}</b> · <i>{title}</i>"
 
 
 def step_done(step: int) -> str:
