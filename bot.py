@@ -493,6 +493,13 @@ async def get_appeal(appeal_id: int):
     return await db_exec("SELECT * FROM appeals WHERE id = ?", (appeal_id,), fetch="one")
 
 
+async def get_latest_appeal(user_id: int):
+    return await db_exec(
+        "SELECT * FROM appeals WHERE user_id = ? ORDER BY id DESC LIMIT 1",
+        (user_id,), fetch="one",
+    )
+
+
 async def set_appeal_admin_msg_id(appeal_id: int, msg_id: int) -> None:
     await db_exec("UPDATE appeals SET admin_msg_id = ? WHERE id = ?", (msg_id, appeal_id))
 
@@ -723,7 +730,10 @@ WAITING_TEXT = (
 
 APPROVED_MSG = (
     "🎉 Вашу заявку <b>приняли</b>, добро пожаловать 🍁\n\n"
-    f"Ссылка на чат: {CHAT_INVITE_LINK}"
+    f"🔗 <b>Ссылка на чат:</b> {CHAT_INVITE_LINK}\n\n"
+    "━━━━━━━━━━━━━━━━━━━━\n"
+    "⚖️ Если в чате вы получили наказание и считаете его "
+    "несправедливым — можете подать апелляцию кнопкой ниже."
 )
 
 REJECTED_MSG = (
@@ -731,10 +741,13 @@ REJECTED_MSG = (
     "Если считаете решение ошибочным — можете подать апелляцию ниже."
 )
 
-APPEAL_FORM_TEXT = (
+APPEAL_FORM_HEADER = (
     "⚖️ <b>Апелляция</b>\n\n"
     "Скопируйте шаблон ниже — <i>тап по блоку = копирование</i>.\n"
-    "Заполните все поля и отправьте <b>одним сообщением</b>.\n\n"
+    "Заполните все поля и отправьте <b>одним сообщением</b>."
+)
+
+APPEAL_FORM_BODY = (
     "━━━━━━━━━━━━━━━━━━━━\n"
     "<pre>"
     "Имя: \n"
@@ -755,8 +768,14 @@ INVALID_APPEAL_TEXT = (
 
 APPEAL_WAITING_TEXT = (
     "⚖️ <b>Апелляция на рассмотрении</b>\n\n"
-    "Администрация изучит её и сообщит решение. Ожидайте."
+    "Администрация изучит её и сообщит решение. Ожидайте.\n"
+    "Если ответа нет долго — нажмите кнопку ниже."
 )
+
+
+async def _send_appeal_form(bot, user_id: int) -> None:
+    await send_msg(bot, user_id, text=APPEAL_FORM_HEADER, parse_mode=ParseMode.HTML)
+    await send_msg(bot, user_id, text=APPEAL_FORM_BODY, parse_mode=ParseMode.HTML)
 
 
 def _blocked_text(until_str: str) -> str:
@@ -810,11 +829,16 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     if state == "awaiting_appeal_form":
-        await send_msg(ctx.bot, user.id, text=APPEAL_FORM_TEXT, parse_mode=ParseMode.HTML)
+        await _send_appeal_form(ctx.bot, user.id)
         return
 
     if state == "appeal_pending":
-        await send_msg(ctx.bot, user.id, text=APPEAL_WAITING_TEXT, parse_mode=ParseMode.HTML)
+        await send_msg(
+            ctx.bot, user.id,
+            text=APPEAL_WAITING_TEXT,
+            parse_mode=ParseMode.HTML,
+            reply_markup=waiting_keyboard(),
+        )
         return
 
     if state == "approved":
@@ -905,7 +929,7 @@ async def cb_ping_admins(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
         return
 
     db_user = await get_user(user.id)
-    if not db_user or db_user["state"] != "pending":
+    if not db_user or db_user["state"] not in ("pending", "appeal_pending"):
         await safe(query.answer, "Заявка уже рассмотрена.", show_alert=True)
         return
 
@@ -918,17 +942,27 @@ async def cb_ping_admins(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
             await safe(query.answer, f"Слишком часто. Подожди {left} сек.", show_alert=True)
         return
 
-    app_row = await get_latest_application(user.id)
-    app_id = app_row["id"] if app_row else "—"
+    if db_user["state"] == "appeal_pending":
+        appeal_row = await get_latest_appeal(user.id)
+        entity_id = appeal_row["id"] if appeal_row else "—"
+        label = "Апелляция"
+        header = "🔔 <b>Просьба обратить внимание на апелляцию</b>"
+        topic_kwargs = _appeal_topic_kwargs()
+    else:
+        app_row = await get_latest_application(user.id)
+        entity_id = app_row["id"] if app_row else "—"
+        label = "Заявка"
+        header = "🔔 <b>Просьба обратить внимание</b>"
+        topic_kwargs = _topic_kwargs()
 
     mentions = await _fetch_admins_mentions(ctx.bot)
     mention_line = mentions if mentions else "(у админов нет username)"
 
     ping_text = (
-        "🔔 <b>Просьба обратить внимание</b>\n\n"
+        f"{header}\n\n"
         f"👤 {('@' + esc(user.username)) if user.username else esc(user.first_name)}\n"
         f"🆔 <code>{user.id}</code>\n"
-        f"📋 Заявка: <b>#{app_id}</b>\n\n"
+        f"📋 {label}: <b>#{entity_id}</b>\n\n"
         f"{mention_line}"
     )
 
@@ -938,12 +972,12 @@ async def cb_ping_admins(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
         text=ping_text,
         parse_mode=ParseMode.HTML,
         disable_web_page_preview=True,
-        **_topic_kwargs(),
+        **topic_kwargs,
     )
 
     if sent is not None:
         await safe(query.answer, "Администрация уведомлена 📣")
-        log.info("User %s pinged admins for app %s", user.id, app_id)
+        log.info("User %s pinged admins (%s %s)", user.id, label, entity_id)
     else:
         await safe(query.answer, "Не получилось отправить, попробуй позже.", show_alert=True)
 
@@ -984,16 +1018,11 @@ def _build_appeal_admin_text(appeal_row, tg_user, prev_app) -> str:
     username_display = f"@{esc(username)}" if username else "без username"
     mention = f'<a href="tg://user?id={user_id}">{esc(first_name)}</a>'
 
-    prev_line = "—"
-    if prev_app is not None:
-        prev_line = f"<code>#{prev_app['id']}</code> · <i>{esc(prev_app['status'])}</i>"
-
     return (
         "⚖️ <b>Новая апелляция</b>\n\n"
         f"👤 <b>Отправитель:</b> {username_display} ({esc(appeal_row['name'])})\n"
         f"🆔 <b>user_id:</b> <code>{user_id}</code>\n"
-        f"🔗 <b>Профиль:</b> {mention}\n"
-        f"📎 <b>Прошлая заявка:</b> {prev_line}\n\n"
+        f"🔗 <b>Профиль:</b> {mention}\n\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
         "📋 <b>Апелляция:</b>\n\n"
         f"<b>Имя:</b> {esc(appeal_row['name'])}\n"
@@ -1042,6 +1071,7 @@ async def on_user_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             ctx.bot, user.id,
             text=APPEAL_WAITING_TEXT,
             parse_mode=ParseMode.HTML,
+            reply_markup=waiting_keyboard(),
         )
         return
 
@@ -1066,9 +1096,8 @@ async def on_user_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         )
         await set_user_state(user.id, "appeal_pending")
 
-        prev_app = await get_latest_application(user.id)
         appeal_row = await get_appeal(appeal_id)
-        admin_text = _build_appeal_admin_text(appeal_row, user, prev_app)
+        admin_text = _build_appeal_admin_text(appeal_row, user, None)
 
         admin_msg = await safe(
             ctx.bot.send_message,
@@ -1088,6 +1117,7 @@ async def on_user_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             ctx.bot, user.id,
             text=APPEAL_WAITING_TEXT,
             parse_mode=ParseMode.HTML,
+            reply_markup=waiting_keyboard(),
         )
         log.info("Appeal %s from user %s submitted to thread %s",
                  appeal_id, user.id, APPEAL_THREAD_ID)
@@ -1424,11 +1454,7 @@ async def cb_appeal_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
     if query.message is not None:
         await strip_buttons(ctx.bot, user.id, query.message.message_id)
 
-    await send_msg(
-        ctx.bot, user.id,
-        text=APPEAL_FORM_TEXT,
-        parse_mode=ParseMode.HTML,
-    )
+    await _send_appeal_form(ctx.bot, user.id)
     await safe(query.answer)
 
 
