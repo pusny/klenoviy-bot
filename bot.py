@@ -32,22 +32,54 @@ def _req(key: str) -> str:
     return val.strip()
 
 
-BOT_TOKEN = _req("BOT_TOKEN")
+def _req_int(key: str) -> int:
+    val = _req(key)
+    try:
+        return int(val)
+    except ValueError:
+        raise RuntimeError(f"{key} должен быть числом, получено: {val!r}")
 
-ADMIN_CHAT_ID    = -1004441293896
-CHAT_INVITE_LINK = "https://t.me/+Ri7977iweXdiMzMy"
-RULES_LINK       = "https://telegra.ph/Pravila-Klenovogo-buketika-10-07"
-DB_PATH          = "bot.db"
 
-TOPIC_THREAD_ID: Optional[int] = 422
+def _opt(key: str, default: str = "") -> str:
+    val = os.getenv(key)
+    return default if val is None else val.strip()
 
-THROTTLE_SECONDS      = 2.0
-PING_COOLDOWN_SECONDS = 3600.0
-CONNECT_TIMEOUT       = 30.0
-READ_TIMEOUT          = 30.0
-WRITE_TIMEOUT         = 30.0
-POOL_TIMEOUT          = 30.0
-START_RETRY_DELAY     = 10.0
+
+def _opt_int(key: str, default: Optional[int] = None) -> Optional[int]:
+    val = os.getenv(key)
+    if val is None or val.strip() == "":
+        return default
+    try:
+        return int(val.strip())
+    except ValueError:
+        return default
+
+
+def _opt_float(key: str, default: float) -> float:
+    val = os.getenv(key)
+    if val is None or val.strip() == "":
+        return default
+    try:
+        return float(val.strip())
+    except ValueError:
+        return default
+
+
+BOT_TOKEN        = _req("BOT_TOKEN")
+ADMIN_CHAT_ID    = _req_int("ADMIN_CHAT_ID")
+CHAT_INVITE_LINK = _req("CHAT_INVITE_LINK")
+RULES_LINK       = _req("RULES_LINK")
+
+TOPIC_THREAD_ID: Optional[int] = _opt_int("TOPIC_THREAD_ID", None)
+DB_PATH = _opt("DB_PATH", "bot.db")
+
+THROTTLE_SECONDS      = _opt_float("THROTTLE_SECONDS", 2.0)
+PING_COOLDOWN_SECONDS = _opt_float("PING_COOLDOWN_SECONDS", 3600.0)
+CONNECT_TIMEOUT       = _opt_float("CONNECT_TIMEOUT", 30.0)
+READ_TIMEOUT          = _opt_float("READ_TIMEOUT", 30.0)
+WRITE_TIMEOUT         = _opt_float("WRITE_TIMEOUT", 30.0)
+POOL_TIMEOUT          = _opt_float("POOL_TIMEOUT", 30.0)
+START_RETRY_DELAY     = _opt_float("START_RETRY_DELAY", 10.0)
 
 
 import asyncio
@@ -125,25 +157,39 @@ def _topic_kwargs() -> dict:
     return {}
 
 
-_last_bot_msg: dict[int, int] = {}
+async def send_msg(bot, chat_id: int, *, text: str, **kwargs):
+    return await safe(bot.send_message, chat_id=chat_id, text=text, **kwargs)
 
 
-async def _send_tracked(bot, chat_id: int, *, text: str, **kwargs):
-    prev = _last_bot_msg.get(chat_id)
-    if prev:
-        await safe(bot.delete_message, chat_id=chat_id, message_id=prev)
-        _last_bot_msg.pop(chat_id, None)
-
-    msg = await safe(bot.send_message, chat_id=chat_id, text=text, **kwargs)
-    if msg is not None:
-        _last_bot_msg[chat_id] = msg.message_id
-    return msg
+async def strip_buttons(bot, chat_id: int, message_id: int) -> None:
+    await safe(
+        bot.edit_message_reply_markup,
+        chat_id=chat_id,
+        message_id=message_id,
+        reply_markup=None,
+    )
 
 
-async def _delete_prev_bot_msg(bot, chat_id: int) -> None:
-    prev = _last_bot_msg.pop(chat_id, None)
-    if prev:
-        await safe(bot.delete_message, chat_id=chat_id, message_id=prev)
+TOTAL_STEPS = 3
+
+
+def _bar(done: int, total: int = TOTAL_STEPS) -> str:
+    done = max(0, min(done, total))
+    return "▰" * done + "▱" * (total - done)
+
+
+def step_header(step: int, title: str) -> str:
+    return (
+        f"<b>Шаг {step}/{TOTAL_STEPS}</b> · <i>{title}</i>\n"
+        f"<code>{_bar(step - 1)}</code>"
+    )
+
+
+def step_done(step: int) -> str:
+    left = TOTAL_STEPS - step
+    if left <= 0:
+        return f"✅ <b>Шаг {step}/{TOTAL_STEPS} пройден</b> · <i>всё готово</i>\n<code>{_bar(step)}</code>"
+    return f"✅ <b>Шаг {step}/{TOTAL_STEPS} пройден</b> · <i>осталось {left}</i>\n<code>{_bar(step)}</code>"
 
 
 _admins_cache: dict[str, object] = {"mentions": "", "fetched_at": 0.0}
@@ -330,31 +376,19 @@ async def get_application(app_id: int):
 
 
 async def set_application_status(app_id: int, status: str) -> None:
-    await db_exec(
-        "UPDATE applications SET status = ? WHERE id = ?",
-        (status, app_id),
-    )
+    await db_exec("UPDATE applications SET status = ? WHERE id = ?", (status, app_id))
 
 
 async def set_video_note(app_id: int, file_id: str) -> None:
-    await db_exec(
-        "UPDATE applications SET video_note_file_id = ? WHERE id = ?",
-        (file_id, app_id),
-    )
+    await db_exec("UPDATE applications SET video_note_file_id = ? WHERE id = ?", (file_id, app_id))
 
 
 async def set_admin_msg_id(app_id: int, admin_msg_id: int) -> None:
-    await db_exec(
-        "UPDATE applications SET admin_msg_id = ? WHERE id = ?",
-        (admin_msg_id, app_id),
-    )
+    await db_exec("UPDATE applications SET admin_msg_id = ? WHERE id = ?", (admin_msg_id, app_id))
 
 
 async def set_video_admin_msg_id(app_id: int, msg_id: int) -> None:
-    await db_exec(
-        "UPDATE applications SET video_admin_msg_id = ? WHERE id = ?",
-        (msg_id, app_id),
-    )
+    await db_exec("UPDATE applications SET video_admin_msg_id = ? WHERE id = ?", (msg_id, app_id))
 
 
 async def decide_application(app_id: int, status: str, decided_by: int) -> None:
@@ -484,44 +518,58 @@ def waiting_keyboard() -> InlineKeyboardMarkup:
 
 
 RULES_TEXT = (
+    f"{step_header(1, 'Правила чата')}\n\n"
     "📋 <b>Правила чата Кленовый букетик</b>\n\n"
-    f"Полный текст правил доступен по ссылке:\n{RULES_LINK}"
+    "Ознакомьтесь с правилами по ссылке ниже и подтвердите согласие.\n\n"
+    f"🔗 {RULES_LINK}"
 )
 
 FORM_TEXT = (
-    "Заполните анкету и отправьте её одним сообщением:\n\n"
-    "<b>Имя:</b>\n"
-    "<b>Возраст:</b>\n"
-    "<b>Болезни физические/психические:</b>\n"
-    "<b>Почему хотите зайти к нам:</b>\n"
-    "<b>О себе по желанию:</b>"
+    f"{step_done(1)}\n\n"
+    f"{step_header(2, 'Анкета')}\n\n"
+    "Скопируйте шаблон ниже — <i>тап по блоку = копирование</i>.\n"
+    "Заполните все поля и отправьте <b>одним сообщением</b>.\n\n"
+    "━━━━━━━━━━━━━━━━━━━━\n"
+    "<pre>"
+    "Имя: \n"
+    "Возраст: \n"
+    "Болезни физические/психические: \n"
+    "Почему хотите зайти к нам: \n"
+    "О себе по желанию: "
+    "</pre>\n"
+    "━━━━━━━━━━━━━━━━━━━━\n\n"
+    "<i>Обязательные поля: Имя, Возраст, Болезни, Причина.</i>"
 )
 
 INVALID_FORM_TEXT = (
-    "❌ Ваша заявка оформлена не по шаблону.\n"
-    "Пожалуйста, заполните все обязательные поля и отправьте анкету одним сообщением."
+    "❌ <b>Анкета оформлена не по шаблону</b>\n\n"
+    "Скопируйте шаблон из сообщения выше, заполните все обязательные поля "
+    "и отправьте <b>одним сообщением</b>.\n\n"
+    "Обязательные: <b>Имя</b>, <b>Возраст</b>, <b>Болезни</b>, <b>Причина</b>."
 )
 
 VIDEO_REQUEST_TEXT = (
+    f"{step_done(2)}\n\n"
+    f"{step_header(3, 'Видео-подтверждение')}\n\n"
     "📹 <b>Подтверждение возраста</b>\n\n"
-    "Чтобы мы могли убедиться, что вам есть 12 лет, "
-    "запишите, пожалуйста, <b>видео-кружок</b> (до 60 секунд), "
-    "в котором вы называете свой возраст и имя, указанное в анкете.\n\n"
-    "Кружок отправляется нажатием на значок 🎥 слева от поля ввода, "
-    "обычное видео или фото не подойдут.\n\n"
-    "После получения кружка ваша заявка уйдёт на рассмотрение администрации."
+    "Запишите <b>видео-кружок</b> (до 60 секунд), в котором вы называете "
+    "свой возраст и имя, указанное в анкете.\n\n"
+    "Значок 🎥 — слева от поля ввода. Обычное видео или фото не подойдут.\n\n"
+    "После получения кружка заявка уйдёт на рассмотрение."
 )
 
 VIDEO_REMINDER_TEXT = (
-    "⚠️ Пожалуйста, отправьте именно <b>видео-кружок</b> (круглое видео до 60 секунд).\n\n"
-    "Нажмите значок 🎥 рядом с полем ввода и запишите короткое видео, "
-    "в котором называете свой возраст и имя из анкеты.\n\n"
+    "⚠️ <b>Нужен именно видео-кружок</b>\n\n"
+    "Нажмите 🎥 рядом с полем ввода и запишите короткое видео до 60 секунд, "
+    "где называете свой возраст и имя из анкеты.\n\n"
     "Текст, фото или обычное видео не принимаются."
 )
 
 WAITING_TEXT = (
-    "⏳ Ожидайте, вашу заявку рассматривают.\n\n"
-    "Если ответа нет долго — нажмите кнопку ниже, чтобы привлечь внимание администрации."
+    f"{step_done(3)}\n\n"
+    "⏳ <b>Заявка на рассмотрении</b>\n\n"
+    "Ожидайте — администрация изучает вашу заявку.\n"
+    "Если ответа нет долго — нажмите кнопку ниже, чтобы привлечь внимание."
 )
 
 
@@ -545,7 +593,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     if db_user and db_user["state"] == "awaiting_video":
-        await _send_tracked(
+        await send_msg(
             ctx.bot, user.id,
             text=VIDEO_REQUEST_TEXT,
             parse_mode=ParseMode.HTML,
@@ -553,7 +601,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     if db_user and db_user["state"] == "pending":
-        await _send_tracked(
+        await send_msg(
             ctx.bot, user.id,
             text=WAITING_TEXT,
             parse_mode=ParseMode.HTML,
@@ -562,7 +610,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     await upsert_user(user.id, user.username, user.first_name)
-    await _send_tracked(
+    await send_msg(
         ctx.bot, user.id,
         text=RULES_TEXT,
         parse_mode=ParseMode.HTML,
@@ -584,11 +632,13 @@ async def cb_refuse(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await add_to_blacklist(user.id, reason="refused_rules")
     await set_user_state(user.id, "rejected")
 
-    _last_bot_msg.pop(user.id, None)
+    if query.message is not None:
+        await strip_buttons(ctx.bot, user.id, query.message.message_id)
 
-    await safe(
-        query.edit_message_text,
-        "Вы отказались от правил чата.\nДоступ к боту закрыт.",
+    await send_msg(
+        ctx.bot, user.id,
+        text="❌ Вы отказались от правил чата.\nДоступ к боту закрыт.",
+        parse_mode=ParseMode.HTML,
     )
     await safe(query.answer)
     log.info("User %s refused rules, blacklisted", user.id)
@@ -606,11 +656,10 @@ async def cb_agree(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     await set_user_state(user.id, "awaiting_form")
 
-    _last_bot_msg.pop(user.id, None)
     if query.message is not None:
-        await safe(ctx.bot.delete_message, chat_id=user.id, message_id=query.message.message_id)
+        await strip_buttons(ctx.bot, user.id, query.message.message_id)
 
-    await _send_tracked(
+    await send_msg(
         ctx.bot, user.id,
         text=FORM_TEXT,
         parse_mode=ParseMode.HTML,
@@ -672,20 +721,6 @@ async def cb_ping_admins(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
         await safe(query.answer, "Не получилось отправить, попробуй позже.", show_alert=True)
 
 
-_session_msgs: dict[int, list[int]] = {}
-
-
-def _track(user_id: int, *ids: int) -> None:
-    bucket = _session_msgs.setdefault(user_id, [])
-    for mid in ids:
-        if mid:
-            bucket.append(mid)
-
-
-def _pop(user_id: int) -> list[int]:
-    return _session_msgs.pop(user_id, [])
-
-
 def _build_admin_text(app_row, tg_user) -> str:
     username = tg_user.username
     user_id = tg_user.id
@@ -727,7 +762,6 @@ async def on_user_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     if await is_blacklisted(user.id):
-        await _try_delete(message)
         return
 
     db_user = await get_user(user.id)
@@ -737,12 +771,10 @@ async def on_user_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     state = db_user["state"]
 
     if state in ("rejected", "approved"):
-        await _try_delete(message)
         return
 
     if state == "awaiting_video":
-        await _try_delete(message)
-        await _send_tracked(
+        await send_msg(
             ctx.bot, user.id,
             text=VIDEO_REMINDER_TEXT,
             parse_mode=ParseMode.HTML,
@@ -752,12 +784,9 @@ async def on_user_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if state != "awaiting_form":
         return
 
-    await _delete_prev_bot_msg(ctx.bot, user.id)
-    _track(user.id, message.message_id)
-
     if await has_active_application(user.id):
         await set_user_state(user.id, "pending")
-        await _send_tracked(
+        await send_msg(
             ctx.bot, user.id,
             text=WAITING_TEXT,
             parse_mode=ParseMode.HTML,
@@ -767,7 +796,7 @@ async def on_user_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     parsed = parse_form(message.text)
     if parsed is None:
-        await _send_tracked(
+        await send_msg(
             ctx.bot, user.id,
             text=INVALID_FORM_TEXT,
             parse_mode=ParseMode.HTML,
@@ -787,11 +816,7 @@ async def on_user_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     )
     await set_user_state(user.id, "awaiting_video")
 
-    for mid in _pop(user.id):
-        await safe(ctx.bot.delete_message, chat_id=message.chat_id, message_id=mid)
-    await safe(ctx.bot.delete_message, chat_id=message.chat_id, message_id=message.message_id)
-
-    await _send_tracked(
+    await send_msg(
         ctx.bot, user.id,
         text=VIDEO_REQUEST_TEXT,
         parse_mode=ParseMode.HTML,
@@ -810,7 +835,6 @@ async def on_user_video_note(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     if await is_blacklisted(user.id):
-        await _try_delete(message)
         return
 
     db_user = await get_user(user.id)
@@ -828,9 +852,7 @@ async def on_user_video_note(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
     await set_application_status(app_id, "pending")
     await set_user_state(user.id, "pending")
 
-    await safe(ctx.bot.delete_message, chat_id=user.id, message_id=message.message_id)
-
-    await _send_tracked(
+    await send_msg(
         ctx.bot, user.id,
         text=WAITING_TEXT,
         parse_mode=ParseMode.HTML,
@@ -865,17 +887,8 @@ async def on_user_video_note(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
     else:
         log.warning("App %s — не доставлено в ветку, но в БД сохранено", app_id)
 
-    log.info("Application %s from user %s fully submitted (video + form) to thread %s",
+    log.info("Application %s from user %s fully submitted to thread %s",
              app_id, user.id, TOPIC_THREAD_ID)
-
-
-async def _try_delete(message) -> None:
-    try:
-        if message.chat_id == ADMIN_CHAT_ID:
-            return
-        await message.delete()
-    except Exception:
-        pass
 
 
 async def _is_admin(bot, chat_id: int, user_id: int) -> bool:
@@ -928,8 +941,6 @@ async def _finalize_admin_message(bot, msg_id: Optional[int], original_text: str
 
 
 async def _notify_user_decision(bot, user_id: int, approved: bool) -> None:
-    _last_bot_msg.pop(user_id, None)
-
     if approved:
         text = (
             "🎉 Вашу заявку <b>приняли</b>, добро пожаловать 🍁\n\n"
@@ -1129,10 +1140,10 @@ async def _start_with_retry() -> Application:
             await app.initialize()
             await app.start()
             await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
-            log.info("Bot running. Thread for applications: %s. Ctrl+C to stop.", TOPIC_THREAD_ID)
+            log.info("Bot running. Thread: %s. Ctrl+C to stop.", TOPIC_THREAD_ID)
             return app
         except (TimedOut, NetworkError) as e:
-            log.warning("Сеть недоступна (%s). Жду %.0f сек и повторяю…",
+            log.warning("Сеть недоступна (%s). Жду %.0f сек…",
                         type(e).__name__, START_RETRY_DELAY)
             try:
                 await app.shutdown()
