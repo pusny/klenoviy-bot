@@ -817,18 +817,33 @@ def _blocked_text(until_str: str) -> str:
 
 async def _build_approved_text(bot, user_id: int) -> str:
     link = None
+    expire_at = datetime.now(timezone.utc) + timedelta(hours=1)
+
     try:
         invite = await bot.create_chat_invite_link(
             chat_id=TARGET_CHAT_ID,
             member_limit=1,
             creates_join_request=True,
+            expire_date=expire_at,
             name=f"u{user_id}",
         )
         link = invite.invite_link
         await save_invite_link(user_id, link)
-        log.info("Invite link created for %s: %s", user_id, link)
+        log.info("Invite link created (limit+request) for %s: %s", user_id, link)
     except Exception as e:
-        log.error("create_chat_invite_link failed for %s: %s", user_id, e)
+        log.warning("limit+request failed (%s), retry without member_limit", e)
+        try:
+            invite = await bot.create_chat_invite_link(
+                chat_id=TARGET_CHAT_ID,
+                creates_join_request=True,
+                expire_date=expire_at,
+                name=f"u{user_id}",
+            )
+            link = invite.invite_link
+            await save_invite_link(user_id, link)
+            log.info("Invite link created (request-only) for %s: %s", user_id, link)
+        except Exception as e2:
+            log.error("create_chat_invite_link failed for %s: %s", user_id, e2)
 
     if not link:
         link = CHAT_INVITE_LINK or "(ссылка недоступна, обратитесь к администрации)"
@@ -1309,19 +1324,26 @@ async def on_join_request(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
 
     log.info("Join request from %s to chat %s via %s", user_id, chat_id, link_str)
 
+    async def _decline(reason: str) -> None:
+        try:
+            await ctx.bot.decline_chat_join_request(chat_id=chat_id, user_id=user_id)
+            log.warning("Join request from %s declined: %s", user_id, reason)
+        except Exception as e:
+            log.error("decline_chat_join_request failed for %s: %s", user_id, e)
+
     if link_str:
         owner_row = await get_invite_owner(link_str)
         if owner_row is not None and int(owner_row["user_id"]) != user_id:
-            log.warning(
-                "Join request from %s ignored: link belongs to %s",
-                user_id, owner_row["user_id"],
+            await _decline(
+                f"link belongs to {owner_row['user_id']}, clicked by {user_id}"
             )
             return
 
     db_user = await get_user(user_id)
     if not db_user or db_user["state"] != "approved":
-        log.warning("Join request from %s ignored (state=%s)",
-                    user_id, db_user["state"] if db_user else "none")
+        await _decline(
+            f"state={db_user['state'] if db_user else 'none'}, expected approved"
+        )
         return
 
     try:
