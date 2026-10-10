@@ -86,6 +86,15 @@ START_RETRY_DELAY     = _opt_float("START_RETRY_DELAY", 10.0)
 
 APPEAL_BLOCK_DAYS = int(_opt_float("APPEAL_BLOCK_DAYS", 14.0))
 
+MAX_CONCURRENT_UPDATES = int(_opt_float("MAX_CONCURRENT_UPDATES", 32))
+WATCHDOG_INTERVAL      = _opt_float("WATCHDOG_INTERVAL", 30.0)
+RESTART_MIN_DELAY      = _opt_float("RESTART_MIN_DELAY", 3.0)
+RESTART_MAX_DELAY      = _opt_float("RESTART_MAX_DELAY", 30.0)
+
+SOFT_PARALLEL_LIMIT    = int(_opt_float("SOFT_PARALLEL_LIMIT", 20))
+QUEUE_WAIT_STEP        = _opt_float("QUEUE_WAIT_STEP", 0.75)
+QUEUE_MAX_WAIT         = _opt_float("QUEUE_MAX_WAIT", 60.0)
+
 
 import asyncio
 import html
@@ -135,6 +144,45 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 log.info("Config loaded | cwd=%s | admin_chat=%s | target_chat=%s | thread=%s | appeal_thread=%s",
          Path.cwd(), ADMIN_CHAT_ID, TARGET_CHAT_ID, TOPIC_THREAD_ID, APPEAL_THREAD_ID)
+
+
+_queue_lock = asyncio.Lock()
+_active_processing = 0
+_queue_order: list[int] = []
+
+
+async def _queue_enter(user_id: int) -> int:
+    global _active_processing
+    async with _queue_lock:
+        if user_id in _queue_order:
+            return _queue_order.index(user_id) + 1
+        if _active_processing < SOFT_PARALLEL_LIMIT:
+            _active_processing += 1
+            return 0
+        _queue_order.append(user_id)
+        return len(_queue_order)
+
+
+async def _queue_leave(user_id: int) -> None:
+    global _active_processing
+    async with _queue_lock:
+        if user_id in _queue_order:
+            _queue_order.remove(user_id)
+        else:
+            _active_processing = max(0, _active_processing - 1)
+        if _queue_order and _active_processing < SOFT_PARALLEL_LIMIT:
+            _active_processing += 1
+            _queue_order.pop(0)
+
+
+def _queue_text(pos: int) -> str:
+    return (
+        "⏳ <b>Вы в очереди</b>\n\n"
+        "Сейчас бот перегружен — много людей пишут одновременно.\n\n"
+        f"📊 <b>Ваша позиция:</b> {pos}\n\n"
+        "Ответ придёт автоматически, как только бот освободится. "
+        "Повторно писать не нужно 🙏"
+    )
 
 
 def esc(value) -> str:
@@ -709,6 +757,7 @@ def parse_appeal(text: str) -> Optional[dict]:
 
 _last_seen: dict[int, float] = defaultdict(float)
 _last_ping: dict[int, float] = defaultdict(float)
+_last_cb: dict[int, float] = defaultdict(float)
 
 
 def is_throttled(user_id: int) -> bool:
@@ -716,6 +765,14 @@ def is_throttled(user_id: int) -> bool:
     if now - _last_seen[user_id] < THROTTLE_SECONDS:
         return True
     _last_seen[user_id] = now
+    return False
+
+
+def is_cb_throttled(user_id: int) -> bool:
+    now = time.monotonic()
+    if now - _last_cb[user_id] < 1.0:
+        return True
+    _last_cb[user_id] = now
     return False
 
 
@@ -938,6 +995,35 @@ async def _build_new_link_text(bot, user_id: int) -> str:
     )
 
 
+async def _await_turn(user_id: int, bot) -> None:
+    pos = await _queue_enter(user_id)
+    if pos == 0:
+        return
+
+    log.info("User %s в очереди, позиция %d", user_id, pos)
+    await send_msg(
+        bot, user_id,
+        text=_queue_text(pos),
+        parse_mode=ParseMode.HTML,
+    )
+
+    waited = 0.0
+    while waited < QUEUE_MAX_WAIT:
+        await asyncio.sleep(QUEUE_WAIT_STEP)
+        waited += QUEUE_WAIT_STEP
+        async with _queue_lock:
+            if user_id not in _queue_order:
+                return
+            new_pos = _queue_order.index(user_id) + 1
+        if new_pos != pos:
+            pos = new_pos
+            await send_msg(
+                bot, user_id,
+                text=_queue_text(pos),
+                parse_mode=ParseMode.HTML,
+            )
+
+
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
     user = update.effective_user
@@ -949,107 +1035,116 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     log.info("/start from %s (@%s)", user.id, user.username or "-")
 
-    if await is_blacklisted(user.id):
-        row = await get_blacklist_row(user.id)
-        if row is not None and row["expires_at"]:
-            until_str = _pretty_dt(row["expires_at"])
+    await _await_turn(user.id, ctx.bot)
+
+    try:
+        if await is_blacklisted(user.id):
+            row = await get_blacklist_row(user.id)
+            if row is not None and row["expires_at"]:
+                until_str = _pretty_dt(row["expires_at"])
+                await send_msg(
+                    ctx.bot, user.id,
+                    text=_blocked_text(until_str),
+                    parse_mode=ParseMode.HTML,
+                )
+            else:
+                await send_msg(
+                    ctx.bot, user.id,
+                    text=(
+                        "🚫 <b>Доступ заблокирован</b>\n\n"
+                        "Обратитесь к администрации чата, если считаете это ошибкой."
+                    ),
+                    parse_mode=ParseMode.HTML,
+                )
+            return
+
+        db_user = await get_user(user.id)
+        state = db_user["state"] if db_user else None
+
+        if state == "awaiting_video":
+            await send_msg(ctx.bot, user.id, text=VIDEO_REQUEST_TEXT, parse_mode=ParseMode.HTML)
+            return
+
+        if state == "pending":
             await send_msg(
                 ctx.bot, user.id,
-                text=_blocked_text(until_str),
+                text=WAITING_TEXT,
                 parse_mode=ParseMode.HTML,
+                reply_markup=waiting_keyboard(),
             )
-        else:
+            return
+
+        if state == "awaiting_form":
+            await send_msg(ctx.bot, user.id, text=FORM_TEXT, parse_mode=ParseMode.HTML)
+            return
+
+        if state == "awaiting_appeal_form":
+            await _send_appeal_form(ctx.bot, user.id)
+            return
+
+        if state == "appeal_pending":
             await send_msg(
                 ctx.bot, user.id,
-                text=(
-                    "🚫 <b>Доступ заблокирован</b>\n\n"
-                    "Обратитесь к администрации чата, если считаете это ошибкой."
-                ),
+                text=APPEAL_WAITING_TEXT,
                 parse_mode=ParseMode.HTML,
+                reply_markup=waiting_keyboard(),
             )
-        return
+            return
 
-    db_user = await get_user(user.id)
-    state = db_user["state"] if db_user else None
-
-    if state == "awaiting_video":
-        await send_msg(ctx.bot, user.id, text=VIDEO_REQUEST_TEXT, parse_mode=ParseMode.HTML)
-        return
-
-    if state == "pending":
-        await send_msg(
-            ctx.bot, user.id,
-            text=WAITING_TEXT,
-            parse_mode=ParseMode.HTML,
-            reply_markup=waiting_keyboard(),
-        )
-        return
-
-    if state == "awaiting_form":
-        await send_msg(ctx.bot, user.id, text=FORM_TEXT, parse_mode=ParseMode.HTML)
-        return
-
-    if state == "awaiting_appeal_form":
-        await _send_appeal_form(ctx.bot, user.id)
-        return
-
-    if state == "appeal_pending":
-        await send_msg(
-            ctx.bot, user.id,
-            text=APPEAL_WAITING_TEXT,
-            parse_mode=ParseMode.HTML,
-            reply_markup=waiting_keyboard(),
-        )
-        return
-
-    if state == "approved":
-        active_link = await get_active_invite_link(user.id)
-        if active_link:
-            text = (
-                "🎉 Вашу заявку <b>приняли</b>, добро пожаловать 🍁\n\n"
-                f"🔗 <b>Ссылка на чат:</b> {active_link}\n\n"
-                "━━━━━━━━━━━━━━━━━━━━\n"
-                "⚖️ Если в чате вы получили наказание и считаете его "
-                "несправедливым — можете подать апелляцию кнопкой ниже."
+        if state == "approved":
+            active_link = await get_active_invite_link(user.id)
+            if active_link:
+                text = (
+                    "🎉 Вашу заявку <b>приняли</b>, добро пожаловать 🍁\n\n"
+                    f"🔗 <b>Ссылка на чат:</b> {active_link}\n\n"
+                    "━━━━━━━━━━━━━━━━━━━━\n"
+                    "⚖️ Если в чате вы получили наказание и считаете его "
+                    "несправедливым — можете подать апелляцию кнопкой ниже."
+                )
+            else:
+                text = (
+                    "🎉 Вашу заявку <b>уже приняли</b> 🍁\n\n"
+                    "Активной ссылки нет. Если нужна — попросите администрацию, "
+                    "вам выдадут новую."
+                )
+            await send_msg(
+                ctx.bot, user.id,
+                text=text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=appeal_button_keyboard(),
+                disable_web_page_preview=True,
             )
-        else:
-            text = (
-                "🎉 Вашу заявку <b>уже приняли</b> 🍁\n\n"
-                "Активной ссылки нет. Если нужна — попросите администрацию, "
-                "вам выдадут новую."
+            return
+
+        if state == "rejected":
+            await send_msg(
+                ctx.bot, user.id,
+                text=REJECTED_MSG,
+                parse_mode=ParseMode.HTML,
+                reply_markup=appeal_button_keyboard(),
             )
+            return
+
+        await upsert_user(user.id, user.username, user.first_name)
         await send_msg(
             ctx.bot, user.id,
-            text=text,
+            text=RULES_TEXT,
             parse_mode=ParseMode.HTML,
-            reply_markup=appeal_button_keyboard(),
-            disable_web_page_preview=True,
+            reply_markup=rules_keyboard(),
+            disable_web_page_preview=False,
         )
-        return
-
-    if state == "rejected":
-        await send_msg(
-            ctx.bot, user.id,
-            text=REJECTED_MSG,
-            parse_mode=ParseMode.HTML,
-            reply_markup=appeal_button_keyboard(),
-        )
-        return
-
-    await upsert_user(user.id, user.username, user.first_name)
-    await send_msg(
-        ctx.bot, user.id,
-        text=RULES_TEXT,
-        parse_mode=ParseMode.HTML,
-        reply_markup=rules_keyboard(),
-        disable_web_page_preview=False,
-    )
+    finally:
+        await _queue_leave(user.id)
 
 
 async def cb_refuse(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     user = update.effective_user
     if query is None or user is None:
+        return
+
+    if is_cb_throttled(user.id):
+        await safe(query.answer)
         return
 
     if await is_blacklisted(user.id):
@@ -1077,6 +1172,10 @@ async def cb_agree(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if query is None or user is None:
         return
 
+    if is_cb_throttled(user.id):
+        await safe(query.answer)
+        return
+
     if await is_blacklisted(user.id):
         await safe(query.answer)
         return
@@ -1098,6 +1197,10 @@ async def cb_ping_admins(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
     query = update.callback_query
     user = update.effective_user
     if query is None or user is None:
+        return
+
+    if is_cb_throttled(user.id):
+        await safe(query.answer)
         return
 
     if await is_blacklisted(user.id):
@@ -1456,7 +1559,7 @@ async def _is_admin(bot, chat_id: int, user_id: int) -> bool:
         member = await bot.get_chat_member(chat_id, user_id)
     except Exception:
         return False
-    return member.status in ("administrator", "creator")
+    return member.status in ("administrator", "creator", "member", "restricted")
 
 
 def _render_decision_text(original_text: str, approved: bool, admin_username: str) -> str:
@@ -1549,11 +1652,15 @@ async def cb_approve(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if query is None or user is None or query.message is None:
         return
 
+    if is_cb_throttled(user.id):
+        await safe(query.answer)
+        return
+
     if query.message.chat_id != ADMIN_CHAT_ID:
         await safe(query.answer, "Недоступно", show_alert=False)
         return
     if not await _is_admin(ctx.bot, ADMIN_CHAT_ID, user.id):
-        await safe(query.answer, "Только для администраторов", show_alert=True)
+        await safe(query.answer, "Только для участников админ-чата", show_alert=True)
         return
 
     app_id = int(query.data.split(":", 1)[1])
@@ -1599,11 +1706,15 @@ async def cb_reject(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if query is None or user is None or query.message is None:
         return
 
+    if is_cb_throttled(user.id):
+        await safe(query.answer)
+        return
+
     if query.message.chat_id != ADMIN_CHAT_ID:
         await safe(query.answer, "Недоступно", show_alert=False)
         return
     if not await _is_admin(ctx.bot, ADMIN_CHAT_ID, user.id):
-        await safe(query.answer, "Только для администраторов", show_alert=True)
+        await safe(query.answer, "Только для участников админ-чата", show_alert=True)
         return
 
     app_id = int(query.data.split(":", 1)[1])
@@ -1646,6 +1757,10 @@ async def cb_appeal_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
     query = update.callback_query
     user = update.effective_user
     if query is None or user is None:
+        return
+
+    if is_cb_throttled(user.id):
+        await safe(query.answer)
         return
 
     if await is_blacklisted(user.id):
@@ -1691,11 +1806,15 @@ async def cb_appeal_approve(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
     if query is None or user is None or query.message is None:
         return
 
+    if is_cb_throttled(user.id):
+        await safe(query.answer)
+        return
+
     if query.message.chat_id != ADMIN_CHAT_ID:
         await safe(query.answer, "Недоступно", show_alert=False)
         return
     if not await _is_admin(ctx.bot, ADMIN_CHAT_ID, user.id):
-        await safe(query.answer, "Только для администраторов", show_alert=True)
+        await safe(query.answer, "Только для участников админ-чата", show_alert=True)
         return
 
     appeal_id = int(query.data.split(":", 1)[1])
@@ -1769,11 +1888,15 @@ async def cb_appeal_reject(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
     if query is None or user is None or query.message is None:
         return
 
+    if is_cb_throttled(user.id):
+        await safe(query.answer)
+        return
+
     if query.message.chat_id != ADMIN_CHAT_ID:
         await safe(query.answer, "Недоступно", show_alert=False)
         return
     if not await _is_admin(ctx.bot, ADMIN_CHAT_ID, user.id):
-        await safe(query.answer, "Только для администраторов", show_alert=True)
+        await safe(query.answer, "Только для участников админ-чата", show_alert=True)
         return
 
     appeal_id = int(query.data.split(":", 1)[1])
@@ -1826,11 +1949,15 @@ async def cb_appeal_newlink(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
     if query is None or user is None or query.message is None:
         return
 
+    if is_cb_throttled(user.id):
+        await safe(query.answer)
+        return
+
     if query.message.chat_id != ADMIN_CHAT_ID:
         await safe(query.answer, "Недоступно", show_alert=False)
         return
     if not await _is_admin(ctx.bot, ADMIN_CHAT_ID, user.id):
-        await safe(query.answer, "Только для администраторов", show_alert=True)
+        await safe(query.answer, "Только для участников админ-чата", show_alert=True)
         return
 
     appeal_id = int(query.data.split(":", 1)[1])
@@ -1967,6 +2094,7 @@ async def _build_app() -> Application:
         .pool_timeout(POOL_TIMEOUT)
         .get_updates_connect_timeout(CONNECT_TIMEOUT)
         .get_updates_read_timeout(READ_TIMEOUT)
+        .concurrent_updates(MAX_CONCURRENT_UPDATES)
         .post_init(_post_init)
         .build()
     )
@@ -2035,32 +2163,65 @@ async def _start_with_retry() -> Application:
             raise
 
 
-async def _watchdog(app: Application, interval: float = 60.0) -> None:
-    while True:
-        await asyncio.sleep(interval)
+async def _watchdog(app: Application, stop_event: asyncio.Event,
+                    interval: float = 30.0) -> None:
+    while not stop_event.is_set():
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=interval)
+            return
+        except asyncio.TimeoutError:
+            pass
+
         updater = app.updater
         if updater is None or not updater.running:
-            log.error("Watchdog: updater.running == False — аварийно завершаем процесс.")
-            os._exit(1)
+            log.error("Watchdog: polling упал — инициирую перезапуск.")
+            stop_event.set()
+            return
+        log.debug("Watchdog: polling живой, ОК.")
 
 
-async def _run_bot() -> None:
+async def _run_bot_once() -> None:
     app = await _start_with_retry()
 
     stop_event = asyncio.Event()
-    watchdog_task = asyncio.create_task(_watchdog(app))
+    watchdog_task = asyncio.create_task(
+        _watchdog(app, stop_event, interval=WATCHDOG_INTERVAL)
+    )
+
     try:
         await stop_event.wait()
     except (KeyboardInterrupt, SystemExit):
         pass
     finally:
         watchdog_task.cancel()
-        log.info("Shutting down…")
+        try:
+            await watchdog_task
+        except (asyncio.CancelledError, Exception):
+            pass
+        log.info("Shutting down app…")
         for step in (app.updater.stop, app.stop, app.shutdown):
             try:
                 await step()
-            except Exception:
-                pass
+            except Exception as e:
+                log.warning("Ошибка при остановке (%s): %s",
+                            getattr(step, "__name__", step), e)
+
+
+async def _run_bot() -> None:
+    backoff = RESTART_MIN_DELAY
+    while True:
+        try:
+            await _run_bot_once()
+            log.info("Bot остановлен корректно. Перезапуск через %.0f сек…",
+                     RESTART_MIN_DELAY)
+            backoff = RESTART_MIN_DELAY
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.exception("Bot упал (%s: %s). Перезапуск через %.0f сек…",
+                          type(e).__name__, e, backoff)
+        await asyncio.sleep(backoff)
+        backoff = min(backoff * 1.5, RESTART_MAX_DELAY)
 
 
 def main() -> None:
