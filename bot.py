@@ -94,6 +94,10 @@ RESTART_MAX_DELAY      = _opt_float("RESTART_MAX_DELAY", 30.0)
 SOFT_PARALLEL_LIMIT    = int(_opt_float("SOFT_PARALLEL_LIMIT", 10))
 SESSION_TIMEOUT        = _opt_float("SESSION_TIMEOUT", 900.0)
 
+QUEUE_NOTIFY_COOLDOWN  = _opt_float("QUEUE_NOTIFY_COOLDOWN", 10.0)
+QUEUE_NOTIFY_GAP       = _opt_float("QUEUE_NOTIFY_GAP", 0.05)
+QUEUE_START_REPEAT_SEC = _opt_float("QUEUE_START_REPEAT_SEC", 20.0)
+
 
 import asyncio
 import html
@@ -152,6 +156,11 @@ _queue_order: list[int] = []
 _queue_bots: dict[int, object] = {}
 _queue_lock = asyncio.Lock()
 
+_queue_positions: dict[int, int] = {}
+_queue_last_shown: dict[int, float] = {}
+_queue_notify_at: dict[int, float] = {}
+_notify_task: Optional[asyncio.Task] = None
+
 
 async def _try_acquire_slot(user_id: int) -> tuple[bool, int]:
     async with _queue_lock:
@@ -179,17 +188,25 @@ async def _release_slot(user_id: int) -> None:
         if user_id in _queue_order:
             _queue_order.remove(user_id)
         _queue_bots.pop(user_id, None)
+        _queue_positions.pop(user_id, None)
+        _queue_last_shown.pop(user_id, None)
+        _queue_notify_at.pop(user_id, None)
     await _advance_queue()
 
 
 async def _advance_queue() -> None:
+    promoted = False
     while True:
         async with _queue_lock:
             if not _queue_order or len(_active_sessions) >= SOFT_PARALLEL_LIMIT:
-                return
+                break
             next_uid = _queue_order.pop(0)
             next_bot = _queue_bots.pop(next_uid, None)
             _active_sessions[next_uid] = time.monotonic()
+            _queue_positions.pop(next_uid, None)
+            _queue_last_shown.pop(next_uid, None)
+            _queue_notify_at.pop(next_uid, None)
+            promoted = True
 
         if next_bot is None:
             continue
@@ -216,6 +233,50 @@ async def _advance_queue() -> None:
         except Exception as e:
             log.warning("Не удалось выдать слот %s: %s", next_uid, e)
 
+    if promoted:
+        _schedule_queue_notify()
+
+
+async def _queue_notify_one(bot, user_id: int, pos: int) -> None:
+    _queue_positions[user_id] = pos
+    _queue_last_shown[user_id] = time.monotonic()
+    _queue_notify_at[user_id] = time.monotonic() + QUEUE_NOTIFY_COOLDOWN
+    await send_msg(bot, user_id, text=_queue_text(pos), parse_mode=ParseMode.HTML)
+
+
+async def _notify_queue_positions() -> None:
+    async with _queue_lock:
+        snapshot = list(_queue_order)
+        bots = dict(_queue_bots)
+
+    now = time.monotonic()
+    sent = 0
+    for i, uid in enumerate(snapshot):
+        pos = i + 1
+        if _queue_positions.get(uid) == pos:
+            continue
+        if now < _queue_notify_at.get(uid, 0.0):
+            continue
+        bot = bots.get(uid)
+        if bot is None:
+            continue
+        try:
+            await _queue_notify_one(bot, uid, pos)
+            sent += 1
+        except Exception as e:
+            log.warning("Не смог обновить позицию %s: %s", uid, e)
+        await asyncio.sleep(QUEUE_NOTIFY_GAP)
+
+    if sent:
+        log.info("Обновлено позиций в очереди: %d (всего в очереди: %d)", sent, len(snapshot))
+
+
+def _schedule_queue_notify() -> None:
+    global _notify_task
+    if _notify_task is not None and not _notify_task.done():
+        return
+    _notify_task = asyncio.create_task(_notify_queue_positions())
+
 
 async def _cleanup_stale_sessions() -> None:
     while True:
@@ -240,6 +301,15 @@ def _queue_text(pos: int) -> str:
         f"📊 <b>Ваша позиция:</b> {pos}\n\n"
         "Как только освободится место — вам автоматически придёт следующий шаг.\n"
         "Повторно писать не нужно 🙏"
+    )
+
+
+def _queue_updated_text(pos: int) -> str:
+    return (
+        "🔄 <b>Ваша позиция обновилась</b>\n\n"
+        f"📊 <b>Теперь вы:</b> {pos} в очереди\n\n"
+        "Продолжайте ждать — как только освободится место, вам автоматически "
+        "придёт следующий шаг 🙏"
     )
 
 
@@ -1090,12 +1160,17 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if state in SLOT_STATES:
         got_slot, pos = await _try_acquire_slot(user.id)
         if not got_slot:
+            now = time.monotonic()
+            last_pos = _queue_positions.get(user.id, 0)
+            last_shown = _queue_last_shown.get(user.id, 0.0)
+
+            if last_pos == pos and (now - last_shown) < QUEUE_START_REPEAT_SEC:
+                log.info("User %s повторно /start, позиция %d не изменилась — игнор",
+                         user.id, pos)
+                return
+
             await _queue_set_bot(user.id, ctx.bot)
-            await send_msg(
-                ctx.bot, user.id,
-                text=_queue_text(pos),
-                parse_mode=ParseMode.HTML,
-            )
+            await _queue_notify_one(ctx.bot, user.id, pos)
             log.info("User %s в очереди, позиция %d (state=%s)", user.id, pos, state)
             return
 
@@ -2231,9 +2306,15 @@ async def _watchdog(app: Application, stop_event: asyncio.Event,
 
 async def _run_bot_once() -> None:
     global _active_sessions, _queue_order, _queue_bots
+    global _queue_positions, _queue_last_shown, _queue_notify_at, _notify_task
+
     _active_sessions = {}
     _queue_order = []
     _queue_bots = {}
+    _queue_positions = {}
+    _queue_last_shown = {}
+    _queue_notify_at = {}
+    _notify_task = None
 
     app = await _start_with_retry()
 
@@ -2252,6 +2333,8 @@ async def _run_bot_once() -> None:
             await watchdog_task
         except (asyncio.CancelledError, Exception):
             pass
+        if _notify_task is not None and not _notify_task.done():
+            _notify_task.cancel()
         log.info("Shutting down app…")
         for step in (app.updater.stop, app.stop, app.shutdown):
             try:
