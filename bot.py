@@ -842,7 +842,7 @@ def _blocked_text(until_str: str) -> str:
         "🚫 <b>Доступ заблокирован</b>\n\n"
         f"Вы не можете подать апелляцию в течение {APPEAL_BLOCK_DAYS} дней.\n\n"
         f"🕒 <b>Блокировка снимется:</b> {until_str}\n\n"
-        "<i>Когда срок истечёт — напишите /start, чтобы подать апелляцию снова.</i>"
+        "<i>Когда срок истёчёт — напишите /start, чтобы подать апелляцию снова.</i>"
     )
 
 
@@ -1942,11 +1942,11 @@ async def _build_app() -> Application:
     ))
     app.add_handler(CommandHandler(
         "untimeban", cmd_untimeban,
-        filters=filters.ChatType.PRIVATE,
+        filters=filters.Chat(ADMIN_CHAT_ID),
     ))
     app.add_handler(CommandHandler(
         "unperm", cmd_unperm,
-        filters=filters.ChatType.PRIVATE,
+        filters=filters.Chat(ADMIN_CHAT_ID),
     ))
 
     app.add_handler(MessageHandler(
