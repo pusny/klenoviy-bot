@@ -556,6 +556,10 @@ async def try_decide_appeal(appeal_id: int, status: str, decided_by: int) -> boo
 
 async def save_invite_link(user_id: int, invite_link: str) -> None:
     await db_exec(
+        "UPDATE invite_links SET used = 1 WHERE user_id = ? AND used = 0",
+        (user_id,),
+    )
+    await db_exec(
         "INSERT INTO invite_links (user_id, invite_link, used) VALUES (?, ?, 0)",
         (user_id, invite_link),
     )
@@ -567,6 +571,15 @@ async def has_active_invite(user_id: int) -> bool:
         (user_id,), fetch="one",
     )
     return row is not None
+
+
+async def get_active_invite_link(user_id: int):
+    row = await db_exec(
+        "SELECT invite_link FROM invite_links "
+        "WHERE user_id = ? AND used = 0 ORDER BY id DESC LIMIT 1",
+        (user_id,), fetch="one",
+    )
+    return row["invite_link"] if row else None
 
 
 async def get_invite_owner(invite_link: str):
@@ -842,7 +855,7 @@ def _blocked_text(until_str: str) -> str:
         "🚫 <b>Доступ заблокирован</b>\n\n"
         f"Вы не можете подать апелляцию в течение {APPEAL_BLOCK_DAYS} дней.\n\n"
         f"🕒 <b>Блокировка снимется:</b> {until_str}\n\n"
-        "<i>Когда срок истёчёт — напишите /start, чтобы подать апелляцию снова.</i>"
+        "<i>Когда срок истечёт — напишите /start, чтобы подать апелляцию снова.</i>"
     )
 
 
@@ -963,13 +976,20 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     if state == "approved":
-        if await has_active_invite(user.id):
-            text = await _build_approved_text(ctx.bot, user.id)
+        active_link = await get_active_invite_link(user.id)
+        if active_link:
+            text = (
+                "🎉 Вашу заявку <b>приняли</b>, добро пожаловать 🍁\n\n"
+                f"🔗 <b>Ссылка на чат:</b> {active_link}\n\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                "⚖️ Если в чате вы получили наказание и считаете его "
+                "несправедливым — можете подать апелляцию кнопкой ниже."
+            )
         else:
             text = (
                 "🎉 Вашу заявку <b>уже приняли</b> 🍁\n\n"
-                "Ссылка была отправлена ранее. Если вы её потеряли — "
-                "обратитесь к администрации."
+                "Активной ссылки нет. Если нужна — попросите администрацию, "
+                "вам выдадут новую."
             )
         await send_msg(
             ctx.bot, user.id,
