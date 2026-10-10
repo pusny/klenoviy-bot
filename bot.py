@@ -104,7 +104,7 @@ from telegram import (
     Update,
 )
 from telegram.constants import ParseMode
-from telegram.error import NetworkError, TimedOut
+from telegram.error import NetworkError, TimedOut, RetryAfter, Forbidden, BadRequest
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -121,7 +121,7 @@ _fmt = logging.Formatter(
     "%Y-%m-%d %H:%M:%S",
 )
 log = logging.getLogger("klenoviy")
-log.setLevel(logging.INFO)
+log.setLevel(logging.DEBUG)
 if not log.handlers:
     _c = logging.StreamHandler()
     _c.setFormatter(_fmt)
@@ -147,13 +147,25 @@ async def safe(coro_fn, *args, retries: int = 3, **kwargs):
     for attempt in range(1, retries + 1):
         try:
             return await coro_fn(*args, **kwargs)
+        except RetryAfter as e:
+            wait = getattr(e, "retry_after", 3)
+            log.warning("safe(): Telegram RetryAfter — ждём %.1f сек (попытка %d/%d)",
+                        wait, attempt, retries)
+            await asyncio.sleep(wait + 1)
+            continue
+        except Forbidden as e:
+            log.warning("safe(): Forbidden — %s", e)
+            return None
+        except BadRequest as e:
+            log.warning("safe(): BadRequest — %s", e)
+            return None
         except (TimedOut, NetworkError) as e:
             if attempt == retries:
                 log.warning("safe(): окончательно упало — %s", e)
                 return None
             await asyncio.sleep(1.5 * attempt)
         except Exception as e:
-            log.debug("safe(): non-network error — %s", e)
+            log.warning("safe(): non-network error — %s: %s", type(e).__name__, e, exc_info=True)
             return None
 
 
@@ -315,7 +327,8 @@ CREATE INDEX IF NOT EXISTS idx_invite_links_link
 
 
 def _sync_init_db() -> None:
-    with sqlite3.connect(DB_PATH) as conn:
+    conn = sqlite3.connect(DB_PATH)
+    try:
         conn.executescript(SCHEMA)
 
         u_cols = {row[1] for row in conn.execute("PRAGMA table_info(users)")}
@@ -333,10 +346,13 @@ def _sync_init_db() -> None:
             conn.execute("ALTER TABLE blacklist ADD COLUMN expires_at TIMESTAMP")
 
         conn.commit()
+    finally:
+        conn.close()
 
 
 def _sync_exec(query: str, params: tuple = (), fetch: Optional[str] = None):
-    with sqlite3.connect(DB_PATH) as conn:
+    conn = sqlite3.connect(DB_PATH, timeout=30.0)
+    try:
         conn.row_factory = sqlite3.Row
         cur = conn.execute(query, params)
         if fetch == "one":
@@ -345,6 +361,8 @@ def _sync_exec(query: str, params: tuple = (), fetch: Optional[str] = None):
             return cur.fetchall()
         conn.commit()
         return cur.lastrowid
+    finally:
+        conn.close()
 
 
 async def db_exec(query: str, params: tuple = (), fetch: Optional[str] = None):
@@ -938,6 +956,15 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             await send_msg(
                 ctx.bot, user.id,
                 text=_blocked_text(until_str),
+                parse_mode=ParseMode.HTML,
+            )
+        else:
+            await send_msg(
+                ctx.bot, user.id,
+                text=(
+                    "🚫 <b>Доступ заблокирован</b>\n\n"
+                    "Обратитесь к администрации чата, если считаете это ошибкой."
+                ),
                 parse_mode=ParseMode.HTML,
             )
         return
@@ -2008,15 +2035,26 @@ async def _start_with_retry() -> Application:
             raise
 
 
+async def _watchdog(app: Application, interval: float = 60.0) -> None:
+    while True:
+        await asyncio.sleep(interval)
+        updater = app.updater
+        if updater is None or not updater.running:
+            log.error("Watchdog: updater.running == False — аварийно завершаем процесс.")
+            os._exit(1)
+
+
 async def _run_bot() -> None:
     app = await _start_with_retry()
 
     stop_event = asyncio.Event()
+    watchdog_task = asyncio.create_task(_watchdog(app))
     try:
         await stop_event.wait()
     except (KeyboardInterrupt, SystemExit):
         pass
     finally:
+        watchdog_task.cancel()
         log.info("Shutting down…")
         for step in (app.updater.stop, app.stop, app.shutdown):
             try:
