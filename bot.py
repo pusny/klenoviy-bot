@@ -92,8 +92,7 @@ RESTART_MIN_DELAY      = _opt_float("RESTART_MIN_DELAY", 3.0)
 RESTART_MAX_DELAY      = _opt_float("RESTART_MAX_DELAY", 30.0)
 
 SOFT_PARALLEL_LIMIT    = int(_opt_float("SOFT_PARALLEL_LIMIT", 10))
-QUEUE_WAIT_STEP        = _opt_float("QUEUE_WAIT_STEP", 0.75)
-QUEUE_MAX_WAIT         = _opt_float("QUEUE_MAX_WAIT", 60.0)
+SESSION_TIMEOUT        = _opt_float("SESSION_TIMEOUT", 900.0)
 
 
 import asyncio
@@ -146,41 +145,100 @@ log.info("Config loaded | cwd=%s | admin_chat=%s | target_chat=%s | thread=%s | 
          Path.cwd(), ADMIN_CHAT_ID, TARGET_CHAT_ID, TOPIC_THREAD_ID, APPEAL_THREAD_ID)
 
 
-_queue_lock = asyncio.Lock()
-_active_processing = 0
+SLOT_STATES = ("new", "awaiting_form", "awaiting_video")
+
+_active_sessions: dict[int, float] = {}
 _queue_order: list[int] = []
+_queue_bots: dict[int, object] = {}
+_queue_lock = asyncio.Lock()
 
 
-async def _queue_enter(user_id: int) -> int:
-    global _active_processing
+async def _try_acquire_slot(user_id: int) -> tuple[bool, int]:
+    async with _queue_lock:
+        if user_id in _active_sessions:
+            _active_sessions[user_id] = time.monotonic()
+            return True, 0
+        if user_id in _queue_order:
+            return False, _queue_order.index(user_id) + 1
+        if len(_active_sessions) < SOFT_PARALLEL_LIMIT:
+            _active_sessions[user_id] = time.monotonic()
+            return True, 0
+        _queue_order.append(user_id)
+        return False, len(_queue_order)
+
+
+async def _queue_set_bot(user_id: int, bot) -> None:
     async with _queue_lock:
         if user_id in _queue_order:
-            return _queue_order.index(user_id) + 1
-        if _active_processing < SOFT_PARALLEL_LIMIT:
-            _active_processing += 1
-            return 0
-        _queue_order.append(user_id)
-        return len(_queue_order)
+            _queue_bots[user_id] = bot
 
 
-async def _queue_leave(user_id: int) -> None:
-    global _active_processing
+async def _release_slot(user_id: int) -> None:
     async with _queue_lock:
+        _active_sessions.pop(user_id, None)
         if user_id in _queue_order:
             _queue_order.remove(user_id)
-        else:
-            _active_processing = max(0, _active_processing - 1)
-        if _queue_order and _active_processing < SOFT_PARALLEL_LIMIT:
-            _active_processing += 1
-            _queue_order.pop(0)
+        _queue_bots.pop(user_id, None)
+    await _advance_queue()
+
+
+async def _advance_queue() -> None:
+    while True:
+        async with _queue_lock:
+            if not _queue_order or len(_active_sessions) >= SOFT_PARALLEL_LIMIT:
+                return
+            next_uid = _queue_order.pop(0)
+            next_bot = _queue_bots.pop(next_uid, None)
+            _active_sessions[next_uid] = time.monotonic()
+
+        if next_bot is None:
+            continue
+
+        try:
+            db_user = await get_user(next_uid)
+        except Exception:
+            db_user = None
+
+        state = db_user["state"] if db_user else "new"
+        try:
+            if state == "awaiting_form":
+                await send_msg(next_bot, next_uid, text=FORM_TEXT, parse_mode=ParseMode.HTML)
+            elif state == "awaiting_video":
+                await send_msg(next_bot, next_uid, text=VIDEO_REQUEST_TEXT, parse_mode=ParseMode.HTML)
+            else:
+                await send_msg(
+                    next_bot, next_uid,
+                    text=RULES_TEXT,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=rules_keyboard(),
+                )
+            log.info("Слот выдан юзеру %s из очереди (state=%s)", next_uid, state)
+        except Exception as e:
+            log.warning("Не удалось выдать слот %s: %s", next_uid, e)
+
+
+async def _cleanup_stale_sessions() -> None:
+    while True:
+        await asyncio.sleep(60)
+        now = time.monotonic()
+        stale: list[int] = []
+        async with _queue_lock:
+            for uid, ts in list(_active_sessions.items()):
+                if now - ts > SESSION_TIMEOUT:
+                    stale.append(uid)
+                    _active_sessions.pop(uid, None)
+        if stale:
+            log.info("Освобождено %d устаревших сессий (бездействие > %.0f сек): %s",
+                     len(stale), SESSION_TIMEOUT, stale)
+            await _advance_queue()
 
 
 def _queue_text(pos: int) -> str:
     return (
         "⏳ <b>Вы в очереди</b>\n\n"
-        "Сейчас бот перегружен — много людей пишут одновременно.\n\n"
+        "Сейчас бот перегружен — много людей заполняют заявки одновременно.\n\n"
         f"📊 <b>Ваша позиция:</b> {pos}\n\n"
-        "Ответ придёт автоматически, как только бот освободится. "
+        "Как только освободится место — вам автоматически придёт следующий шаг.\n"
         "Повторно писать не нужно 🙏"
     )
 
@@ -995,35 +1053,6 @@ async def _build_new_link_text(bot, user_id: int) -> str:
     )
 
 
-async def _await_turn(user_id: int, bot) -> None:
-    pos = await _queue_enter(user_id)
-    if pos == 0:
-        return
-
-    log.info("User %s в очереди, позиция %d", user_id, pos)
-    await send_msg(
-        bot, user_id,
-        text=_queue_text(pos),
-        parse_mode=ParseMode.HTML,
-    )
-
-    waited = 0.0
-    while waited < QUEUE_MAX_WAIT:
-        await asyncio.sleep(QUEUE_WAIT_STEP)
-        waited += QUEUE_WAIT_STEP
-        async with _queue_lock:
-            if user_id not in _queue_order:
-                return
-            new_pos = _queue_order.index(user_id) + 1
-        if new_pos != pos:
-            pos = new_pos
-            await send_msg(
-                bot, user_id,
-                text=_queue_text(pos),
-                parse_mode=ParseMode.HTML,
-            )
-
-
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
     user = update.effective_user
@@ -1035,106 +1064,113 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     log.info("/start from %s (@%s)", user.id, user.username or "-")
 
-    await _await_turn(user.id, ctx.bot)
-
-    try:
-        if await is_blacklisted(user.id):
-            row = await get_blacklist_row(user.id)
-            if row is not None and row["expires_at"]:
-                until_str = _pretty_dt(row["expires_at"])
-                await send_msg(
-                    ctx.bot, user.id,
-                    text=_blocked_text(until_str),
-                    parse_mode=ParseMode.HTML,
-                )
-            else:
-                await send_msg(
-                    ctx.bot, user.id,
-                    text=(
-                        "🚫 <b>Доступ заблокирован</b>\n\n"
-                        "Обратитесь к администрации чата, если считаете это ошибкой."
-                    ),
-                    parse_mode=ParseMode.HTML,
-                )
-            return
-
-        db_user = await get_user(user.id)
-        state = db_user["state"] if db_user else None
-
-        if state == "awaiting_video":
-            await send_msg(ctx.bot, user.id, text=VIDEO_REQUEST_TEXT, parse_mode=ParseMode.HTML)
-            return
-
-        if state == "pending":
+    if await is_blacklisted(user.id):
+        row = await get_blacklist_row(user.id)
+        if row is not None and row["expires_at"]:
+            until_str = _pretty_dt(row["expires_at"])
             await send_msg(
                 ctx.bot, user.id,
-                text=WAITING_TEXT,
+                text=_blocked_text(until_str),
                 parse_mode=ParseMode.HTML,
-                reply_markup=waiting_keyboard(),
             )
-            return
-
-        if state == "awaiting_form":
-            await send_msg(ctx.bot, user.id, text=FORM_TEXT, parse_mode=ParseMode.HTML)
-            return
-
-        if state == "awaiting_appeal_form":
-            await _send_appeal_form(ctx.bot, user.id)
-            return
-
-        if state == "appeal_pending":
+        else:
             await send_msg(
                 ctx.bot, user.id,
-                text=APPEAL_WAITING_TEXT,
+                text=(
+                    "🚫 <b>Доступ заблокирован</b>\n\n"
+                    "Обратитесь к администрации чата, если считаете это ошибкой."
+                ),
                 parse_mode=ParseMode.HTML,
-                reply_markup=waiting_keyboard(),
             )
-            return
+        return
 
-        if state == "approved":
-            active_link = await get_active_invite_link(user.id)
-            if active_link:
-                text = (
-                    "🎉 Вашу заявку <b>приняли</b>, добро пожаловать 🍁\n\n"
-                    f"🔗 <b>Ссылка на чат:</b> {active_link}\n\n"
-                    "━━━━━━━━━━━━━━━━━━━━\n"
-                    "⚖️ Если в чате вы получили наказание и считаете его "
-                    "несправедливым — можете подать апелляцию кнопкой ниже."
-                )
-            else:
-                text = (
-                    "🎉 Вашу заявку <b>уже приняли</b> 🍁\n\n"
-                    "Активной ссылки нет. Если нужна — попросите администрацию, "
-                    "вам выдадут новую."
-                )
+    db_user = await get_user(user.id)
+    state = db_user["state"] if db_user else "new"
+
+    if state in SLOT_STATES:
+        got_slot, pos = await _try_acquire_slot(user.id)
+        if not got_slot:
+            await _queue_set_bot(user.id, ctx.bot)
             await send_msg(
                 ctx.bot, user.id,
-                text=text,
+                text=_queue_text(pos),
                 parse_mode=ParseMode.HTML,
-                reply_markup=appeal_button_keyboard(),
-                disable_web_page_preview=True,
             )
+            log.info("User %s в очереди, позиция %d (state=%s)", user.id, pos, state)
             return
 
-        if state == "rejected":
-            await send_msg(
-                ctx.bot, user.id,
-                text=REJECTED_MSG,
-                parse_mode=ParseMode.HTML,
-                reply_markup=appeal_button_keyboard(),
-            )
-            return
+    if state == "awaiting_video":
+        await send_msg(ctx.bot, user.id, text=VIDEO_REQUEST_TEXT, parse_mode=ParseMode.HTML)
+        return
 
-        await upsert_user(user.id, user.username, user.first_name)
+    if state == "pending":
         await send_msg(
             ctx.bot, user.id,
-            text=RULES_TEXT,
+            text=WAITING_TEXT,
             parse_mode=ParseMode.HTML,
-            reply_markup=rules_keyboard(),
-            disable_web_page_preview=False,
+            reply_markup=waiting_keyboard(),
         )
-    finally:
-        await _queue_leave(user.id)
+        return
+
+    if state == "awaiting_form":
+        await send_msg(ctx.bot, user.id, text=FORM_TEXT, parse_mode=ParseMode.HTML)
+        return
+
+    if state == "awaiting_appeal_form":
+        await _send_appeal_form(ctx.bot, user.id)
+        return
+
+    if state == "appeal_pending":
+        await send_msg(
+            ctx.bot, user.id,
+            text=APPEAL_WAITING_TEXT,
+            parse_mode=ParseMode.HTML,
+            reply_markup=waiting_keyboard(),
+        )
+        return
+
+    if state == "approved":
+        active_link = await get_active_invite_link(user.id)
+        if active_link:
+            text = (
+                "🎉 Вашу заявку <b>приняли</b>, добро пожаловать 🍁\n\n"
+                f"🔗 <b>Ссылка на чат:</b> {active_link}\n\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                "⚖️ Если в чате вы получили наказание и считаете его "
+                "несправедливым — можете подать апелляцию кнопкой ниже."
+            )
+        else:
+            text = (
+                "🎉 Вашу заявку <b>уже приняли</b> 🍁\n\n"
+                "Активной ссылки нет. Если нужна — попросите администрацию, "
+                "вам выдадут новую."
+            )
+        await send_msg(
+            ctx.bot, user.id,
+            text=text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=appeal_button_keyboard(),
+            disable_web_page_preview=True,
+        )
+        return
+
+    if state == "rejected":
+        await send_msg(
+            ctx.bot, user.id,
+            text=REJECTED_MSG,
+            parse_mode=ParseMode.HTML,
+            reply_markup=appeal_button_keyboard(),
+        )
+        return
+
+    await upsert_user(user.id, user.username, user.first_name)
+    await send_msg(
+        ctx.bot, user.id,
+        text=RULES_TEXT,
+        parse_mode=ParseMode.HTML,
+        reply_markup=rules_keyboard(),
+        disable_web_page_preview=False,
+    )
 
 
 async def cb_refuse(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1153,6 +1189,7 @@ async def cb_refuse(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     await add_to_blacklist(user.id, reason="refused_rules", expires_at=None)
     await set_user_state(user.id, "rejected")
+    await _release_slot(user.id)
 
     if query.message is not None:
         await strip_buttons(ctx.bot, user.id, query.message.message_id)
@@ -1163,7 +1200,7 @@ async def cb_refuse(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         parse_mode=ParseMode.HTML,
     )
     await safe(query.answer)
-    log.info("User %s refused rules, blacklisted", user.id)
+    log.info("User %s refused rules, blacklisted, slot released", user.id)
 
 
 async def cb_agree(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1325,6 +1362,9 @@ async def on_user_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if is_throttled(user.id):
         return
 
+    if user.id in _active_sessions:
+        _active_sessions[user.id] = time.monotonic()
+
     if await is_blacklisted(user.id):
         return
 
@@ -1407,6 +1447,7 @@ async def on_user_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     if await has_active_application(user.id):
         await set_user_state(user.id, "pending")
+        await _release_slot(user.id)
         await send_msg(
             ctx.bot, user.id,
             text=WAITING_TEXT,
@@ -1455,6 +1496,9 @@ async def on_user_video_note(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
     if message.chat.type != "private":
         return
 
+    if user.id in _active_sessions:
+        _active_sessions[user.id] = time.monotonic()
+
     if await is_blacklisted(user.id):
         return
 
@@ -1472,6 +1516,8 @@ async def on_user_video_note(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
     await set_video_note(app_id, file_id)
     await set_application_status(app_id, "pending")
     await set_user_state(user.id, "pending")
+
+    await _release_slot(user.id)
 
     await send_msg(
         ctx.bot, user.id,
@@ -1508,8 +1554,7 @@ async def on_user_video_note(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
     else:
         log.warning("App %s — не доставлено в ветку, но в БД сохранено", app_id)
 
-    log.info("Application %s from user %s fully submitted to thread %s",
-             app_id, user.id, TOPIC_THREAD_ID)
+    log.info("Application %s from user %s fully submitted, slot released", app_id, user.id)
 
 
 async def on_join_request(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2071,6 +2116,7 @@ async def _post_init(app: Application) -> None:
         ])
     except Exception as e:
         log.warning("set_my_commands failed: %s", e)
+    asyncio.create_task(_cleanup_stale_sessions())
 
 
 async def _error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2147,8 +2193,10 @@ async def _start_with_retry() -> Application:
             await app.initialize()
             await app.start()
             await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
-            log.info("Bot running. App thread: %s. Appeal thread: %s. Target chat: %s.",
-                     TOPIC_THREAD_ID, APPEAL_THREAD_ID, TARGET_CHAT_ID)
+            log.info("Bot running. App thread: %s. Appeal thread: %s. Target chat: %s. "
+                     "Slot limit: %d, session timeout: %.0f сек.",
+                     TOPIC_THREAD_ID, APPEAL_THREAD_ID, TARGET_CHAT_ID,
+                     SOFT_PARALLEL_LIMIT, SESSION_TIMEOUT)
             return app
         except (TimedOut, NetworkError) as e:
             log.warning("Сеть недоступна (%s). Жду %.0f сек…",
@@ -2177,10 +2225,16 @@ async def _watchdog(app: Application, stop_event: asyncio.Event,
             log.error("Watchdog: polling упал — инициирую перезапуск.")
             stop_event.set()
             return
-        log.debug("Watchdog: polling живой, ОК.")
+        log.debug("Watchdog: polling живой, ОК. Активных сессий: %d, в очереди: %d",
+                  len(_active_sessions), len(_queue_order))
 
 
 async def _run_bot_once() -> None:
+    global _active_sessions, _queue_order, _queue_bots
+    _active_sessions = {}
+    _queue_order = []
+    _queue_bots = {}
+
     app = await _start_with_retry()
 
     stop_event = asyncio.Event()
