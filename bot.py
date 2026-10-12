@@ -181,28 +181,12 @@ def _check_persistence() -> bool:
         return False
 
 
-def _wal_checkpoint(passive: bool = False) -> None:
-    if not DB_FILE.exists():
-        return
-    try:
-        with sqlite3.connect(DB_PATH, timeout=10.0) as c:
-            c.execute("PRAGMA busy_timeout=5000;")
-            mode = "PASSIVE" if passive else "TRUNCATE"
-            c.execute(f"PRAGMA wal_checkpoint({mode});")
-    except Exception:
-        pass
-
-
 def _backup_rotate(keep: int = 5) -> None:
     if not DB_FILE.exists():
         return
-    try:
-        _wal_checkpoint()
-    except Exception:
-        pass
 
     ts = time.strftime("%Y%m%d_%H%M%S")
-    for suffix in ("", "-wal", "-shm"):
+    for suffix in ("", "-wal", "-shm", "-journal"):
         src = Path(str(DB_FILE) + suffix)
         if not src.exists():
             continue
@@ -213,7 +197,7 @@ def _backup_rotate(keep: int = 5) -> None:
             pass
 
     try:
-        for suffix in ("", "-wal", "-shm"):
+        for suffix in ("", "-wal", "-shm", "-journal"):
             pattern = DB_FILE.name + ".*.bak" + suffix
             files = sorted(
                 DB_DIR.glob(pattern),
@@ -414,11 +398,6 @@ async def _housekeeping() -> None:
             _gc_throttle_dicts()
 
             try:
-                _wal_checkpoint(passive=True)
-            except Exception:
-                pass
-
-            try:
                 cutoff_days = int(MESSAGES_RETENTION_DAYS)
                 if cutoff_days > 0:
                     await db_exec(
@@ -566,8 +545,6 @@ async def _fetch_admins_mentions(bot) -> str:
 
 
 SCHEMA = """
-PRAGMA journal_mode=WAL;
-
 CREATE TABLE IF NOT EXISTS users (
     user_id          INTEGER PRIMARY KEY,
     username         TEXT,
@@ -645,10 +622,9 @@ CREATE INDEX IF NOT EXISTS idx_invite_links_link
 def _sync_init_db() -> None:
     conn = sqlite3.connect(DB_PATH, timeout=30.0)
     try:
-        conn.execute("PRAGMA journal_mode=WAL;")
-        conn.execute("PRAGMA synchronous=NORMAL;")
-        conn.execute("PRAGMA busy_timeout=10000;")
-        conn.execute("PRAGMA wal_autocheckpoint=1000;")
+        conn.execute("PRAGMA journal_mode=DELETE;")
+        conn.execute("PRAGMA synchronous=FULL;")
+        conn.execute("PRAGMA busy_timeout=15000;")
         conn.executescript(SCHEMA)
 
         u_cols = {row[1] for row in conn.execute("PRAGMA table_info(users)")}
@@ -672,11 +648,13 @@ def _sync_init_db() -> None:
 
 def _sync_exec(query: str, params: tuple = (), fetch: Optional[str] = None):
     last_err = None
-    for attempt in range(4):
+    for attempt in range(5):
         try:
             conn = sqlite3.connect(DB_PATH, timeout=30.0)
             try:
-                conn.execute("PRAGMA busy_timeout=10000;")
+                conn.execute("PRAGMA journal_mode=DELETE;")
+                conn.execute("PRAGMA synchronous=FULL;")
+                conn.execute("PRAGMA busy_timeout=15000;")
                 conn.row_factory = sqlite3.Row
                 cur = conn.execute(query, params)
                 if fetch == "one":
@@ -689,8 +667,9 @@ def _sync_exec(query: str, params: tuple = (), fetch: Optional[str] = None):
                 conn.close()
         except sqlite3.OperationalError as e:
             last_err = e
-            if "locked" in str(e).lower() and attempt < 3:
-                time.sleep(0.15 * (attempt + 1))
+            msg = str(e).lower()
+            if ("locked" in msg or "busy" in msg) and attempt < 4:
+                time.sleep(0.25 * (attempt + 1))
                 continue
             raise
     if last_err:
@@ -1631,18 +1610,37 @@ async def on_user_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             )
             return
 
-        appeal_id = await create_appeal(
-            user_id=user.id,
-            username_at_submit=user.username,
-            first_name_at_submit=user.first_name,
-            name=parsed["name"],
-            age=parsed["age"],
-            punishment_type=parsed["punishment_type"],
-            description=parsed["description"],
-        )
+        try:
+            appeal_id = await create_appeal(
+                user_id=user.id,
+                username_at_submit=user.username,
+                first_name_at_submit=user.first_name,
+                name=parsed["name"],
+                age=parsed["age"],
+                punishment_type=parsed["punishment_type"],
+                description=parsed["description"],
+            )
+        except Exception as e:
+            log.exception("create_appeal failed for user %s: %s", user.id, e)
+            await send_msg(
+                ctx.bot, user.id,
+                text="⚠️ Не удалось сохранить апелляцию. Попробуйте отправить ещё раз через минуту.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
         await set_user_state(user.id, "appeal_pending")
 
         appeal_row = await get_appeal(appeal_id)
+        if appeal_row is None:
+            log.error("Appeal %s created but not readable right after insert", appeal_id)
+            await send_msg(
+                ctx.bot, user.id,
+                text="⚠️ Ошибка сохранения. Попробуйте ещё раз.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
         admin_text = _build_appeal_admin_text(appeal_row, user)
 
         admin_msg = await safe(
@@ -1692,17 +1690,27 @@ async def on_user_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
-    app_id = await create_application(
-        user_id=user.id,
-        username_at_submit=user.username,
-        first_name_at_submit=user.first_name,
-        name=parsed.name,
-        age=parsed.age,
-        diseases=parsed.diseases,
-        reason=parsed.reason,
-        about=parsed.about,
-        status="awaiting_video",
-    )
+    try:
+        app_id = await create_application(
+            user_id=user.id,
+            username_at_submit=user.username,
+            first_name_at_submit=user.first_name,
+            name=parsed.name,
+            age=parsed.age,
+            diseases=parsed.diseases,
+            reason=parsed.reason,
+            about=parsed.about,
+            status="awaiting_video",
+        )
+    except Exception as e:
+        log.exception("create_application failed for user %s: %s", user.id, e)
+        await send_msg(
+            ctx.bot, user.id,
+            text="⚠️ Не удалось сохранить анкету. Попробуйте отправить ещё раз через минуту.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
     await set_user_state(user.id, "awaiting_video")
 
     await send_msg(
@@ -1740,9 +1748,18 @@ async def on_user_video_note(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
     app_id = app_row["id"]
     file_id = message.video_note.file_id
 
-    await set_video_note(app_id, file_id)
-    await set_application_status(app_id, "pending")
-    await set_user_state(user.id, "pending")
+    try:
+        await set_video_note(app_id, file_id)
+        await set_application_status(app_id, "pending")
+        await set_user_state(user.id, "pending")
+    except Exception as e:
+        log.exception("Failed to finalize application %s: %s", app_id, e)
+        await send_msg(
+            ctx.bot, user.id,
+            text="⚠️ Ошибка сохранения. Попробуйте ещё раз.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
 
     await _release_slot(user.id)
 
@@ -1918,6 +1935,17 @@ async def _finalize_appeal_admin_message(bot, msg_id: Optional[int], original_te
     )
 
 
+async def _strip_buttons_from_query(ctx, query) -> None:
+    if query is None or query.message is None:
+        return
+    await safe(
+        ctx.bot.edit_message_reply_markup,
+        chat_id=query.message.chat_id,
+        message_id=query.message.message_id,
+        reply_markup=None,
+    )
+
+
 async def cb_approve(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     user = update.effective_user
@@ -1938,7 +1966,12 @@ async def cb_approve(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     app_id = int(query.data.split(":", 1)[1])
     app_row = await get_application(app_id)
     if not app_row:
-        await safe(query.answer, "Заявка не найдена", show_alert=True)
+        await safe(
+            query.answer,
+            "Заявка не найдена в БД. Обработайте вручную.",
+            show_alert=True,
+        )
+        await _strip_buttons_from_query(ctx, query)
         return
 
     target_user_id = app_row["user_id"]
@@ -1946,6 +1979,7 @@ async def cb_approve(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     won = await try_decide_application(app_id, "approved", user.id)
     if not won:
         await safe(query.answer, "Заявка уже обработана", show_alert=False)
+        await _strip_buttons_from_query(ctx, query)
         return
 
     await set_user_state(target_user_id, "approved")
@@ -1992,7 +2026,12 @@ async def cb_reject(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     app_id = int(query.data.split(":", 1)[1])
     app_row = await get_application(app_id)
     if not app_row:
-        await safe(query.answer, "Заявка не найдена", show_alert=True)
+        await safe(
+            query.answer,
+            "Заявка не найдена в БД. Обработайте вручную.",
+            show_alert=True,
+        )
+        await _strip_buttons_from_query(ctx, query)
         return
 
     target_user_id = app_row["user_id"]
@@ -2000,6 +2039,7 @@ async def cb_reject(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     won = await try_decide_application(app_id, "rejected", user.id)
     if not won:
         await safe(query.answer, "Заявка уже обработана", show_alert=False)
+        await _strip_buttons_from_query(ctx, query)
         return
 
     await set_user_state(target_user_id, "rejected")
@@ -2092,7 +2132,12 @@ async def cb_appeal_approve(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
     appeal_id = int(query.data.split(":", 1)[1])
     appeal_row = await get_appeal(appeal_id)
     if not appeal_row:
-        await safe(query.answer, "Апелляция не найдена", show_alert=True)
+        await safe(
+            query.answer,
+            "Апелляция не найдена в БД. Обработайте вручную.",
+            show_alert=True,
+        )
+        await _strip_buttons_from_query(ctx, query)
         return
 
     target_user_id = appeal_row["user_id"]
@@ -2100,6 +2145,7 @@ async def cb_appeal_approve(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
     won = await try_decide_appeal(appeal_id, "approved", user.id)
     if not won:
         await safe(query.answer, "Апелляция уже обработана", show_alert=False)
+        await _strip_buttons_from_query(ctx, query)
         return
 
     target_user = await get_user(target_user_id)
@@ -2174,7 +2220,12 @@ async def cb_appeal_reject(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
     appeal_id = int(query.data.split(":", 1)[1])
     appeal_row = await get_appeal(appeal_id)
     if not appeal_row:
-        await safe(query.answer, "Апелляция не найдена", show_alert=True)
+        await safe(
+            query.answer,
+            "Апелляция не найдена в БД. Обработайте вручную.",
+            show_alert=True,
+        )
+        await _strip_buttons_from_query(ctx, query)
         return
 
     target_user_id = appeal_row["user_id"]
@@ -2182,6 +2233,7 @@ async def cb_appeal_reject(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
     won = await try_decide_appeal(appeal_id, "rejected", user.id)
     if not won:
         await safe(query.answer, "Апелляция уже обработана", show_alert=False)
+        await _strip_buttons_from_query(ctx, query)
         return
 
     until_str = _future_utc_str(APPEAL_BLOCK_DAYS)
@@ -2235,7 +2287,12 @@ async def cb_appeal_newlink(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
     appeal_id = int(query.data.split(":", 1)[1])
     appeal_row = await get_appeal(appeal_id)
     if not appeal_row:
-        await safe(query.answer, "Апелляция не найдена", show_alert=True)
+        await safe(
+            query.answer,
+            "Апелляция не найдена в БД. Обработайте вручную.",
+            show_alert=True,
+        )
+        await _strip_buttons_from_query(ctx, query)
         return
 
     target_user_id = appeal_row["user_id"]
@@ -2243,6 +2300,7 @@ async def cb_appeal_newlink(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
     won = await try_decide_appeal(appeal_id, "new_link", user.id)
     if not won:
         await safe(query.answer, "Апелляция уже обработана", show_alert=False)
+        await _strip_buttons_from_query(ctx, query)
         return
 
     await remove_from_blacklist(target_user_id)
@@ -2516,10 +2574,6 @@ async def _run_bot_once() -> None:
         if _notify_task is not None and not _notify_task.done():
             _notify_task.cancel()
         await _shutdown_app(app)
-        try:
-            await asyncio.to_thread(_wal_checkpoint)
-        except Exception:
-            pass
 
 
 async def _run_bot() -> None:
