@@ -76,7 +76,14 @@ RULES_LINK       = _req("RULES_LINK")
 
 TOPIC_THREAD_ID: Optional[int]  = _opt_int("TOPIC_THREAD_ID", None)
 APPEAL_THREAD_ID: Optional[int] = _opt_int("APPEAL_THREAD_ID", None)
-DB_PATH = _opt("DB_PATH", "bot.db")
+
+_data_dir = (os.getenv("DATA_DIR") or "").strip()
+if _data_dir:
+    DB_FILE = Path(_data_dir) / "bot.db"
+else:
+    DB_FILE = Path(_opt("DB_PATH", "bot.db"))
+
+DB_PATH = str(DB_FILE)
 
 THROTTLE_SECONDS      = _opt_float("THROTTLE_SECONDS", 2.0)
 PING_COOLDOWN_SECONDS = _opt_float("PING_COOLDOWN_SECONDS", 3600.0)
@@ -152,8 +159,7 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
-DB_FILE = Path(DB_PATH)
-DB_DIR  = DB_FILE.parent if str(DB_FILE.parent) not in ("", ".") else Path(".")
+DB_DIR = DB_FILE.parent if str(DB_FILE.parent) not in ("", ".") else Path(".")
 try:
     DB_DIR.mkdir(parents=True, exist_ok=True)
 except Exception as _e:
@@ -179,7 +185,7 @@ def _wal_checkpoint(passive: bool = False) -> None:
     if not DB_FILE.exists():
         return
     try:
-        with sqlite3.connect(str(DB_FILE), timeout=10.0) as c:
+        with sqlite3.connect(DB_PATH, timeout=10.0) as c:
             c.execute("PRAGMA busy_timeout=5000;")
             mode = "PASSIVE" if passive else "TRUNCATE"
             c.execute(f"PRAGMA wal_checkpoint({mode});")
@@ -637,7 +643,7 @@ CREATE INDEX IF NOT EXISTS idx_invite_links_link
 
 
 def _sync_init_db() -> None:
-    conn = sqlite3.connect(str(DB_FILE), timeout=30.0)
+    conn = sqlite3.connect(DB_PATH, timeout=30.0)
     try:
         conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute("PRAGMA synchronous=NORMAL;")
@@ -668,7 +674,7 @@ def _sync_exec(query: str, params: tuple = (), fetch: Optional[str] = None):
     last_err = None
     for attempt in range(4):
         try:
-            conn = sqlite3.connect(str(DB_FILE), timeout=30.0)
+            conn = sqlite3.connect(DB_PATH, timeout=30.0)
             try:
                 conn.execute("PRAGMA busy_timeout=10000;")
                 conn.row_factory = sqlite3.Row
