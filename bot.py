@@ -14,6 +14,8 @@ _ensure("python-dotenv", "dotenv")
 
 
 import os
+import gc
+import shutil
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
@@ -87,7 +89,8 @@ START_RETRY_DELAY     = _opt_float("START_RETRY_DELAY", 10.0)
 APPEAL_BLOCK_DAYS = int(_opt_float("APPEAL_BLOCK_DAYS", 14.0))
 
 MAX_CONCURRENT_UPDATES = int(_opt_float("MAX_CONCURRENT_UPDATES", 16))
-WATCHDOG_INTERVAL      = _opt_float("WATCHDOG_INTERVAL", 30.0)
+WATCHDOG_INTERVAL      = _opt_float("WATCHDOG_INTERVAL", 60.0)
+WATCHDOG_MAX_FAILS     = int(_opt_float("WATCHDOG_MAX_FAILS", 5.0))
 RESTART_MIN_DELAY      = _opt_float("RESTART_MIN_DELAY", 3.0)
 RESTART_MAX_DELAY      = _opt_float("RESTART_MAX_DELAY", 30.0)
 
@@ -97,6 +100,9 @@ SESSION_TIMEOUT        = _opt_float("SESSION_TIMEOUT", 900.0)
 QUEUE_NOTIFY_COOLDOWN  = _opt_float("QUEUE_NOTIFY_COOLDOWN", 10.0)
 QUEUE_NOTIFY_GAP       = _opt_float("QUEUE_NOTIFY_GAP", 0.05)
 QUEUE_START_REPEAT_SEC = _opt_float("QUEUE_START_REPEAT_SEC", 20.0)
+
+GC_INTERVAL            = _opt_float("GC_INTERVAL", 300.0)
+MESSAGES_RETENTION_DAYS = _opt_float("MESSAGES_RETENTION_DAYS", 30.0)
 
 
 import asyncio
@@ -133,7 +139,7 @@ _fmt = logging.Formatter(
     "%Y-%m-%d %H:%M:%S",
 )
 log = logging.getLogger("klenoviy")
-log.setLevel(logging.DEBUG)
+log.setLevel(logging.INFO)
 if not log.handlers:
     _c = logging.StreamHandler()
     _c.setFormatter(_fmt)
@@ -145,8 +151,88 @@ if not log.handlers:
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
+
+DB_FILE = Path(DB_PATH)
+DB_DIR  = DB_FILE.parent if str(DB_FILE.parent) not in ("", ".") else Path(".")
+try:
+    DB_DIR.mkdir(parents=True, exist_ok=True)
+except Exception as _e:
+    raise RuntimeError(f"Не могу создать директорию БД {DB_DIR}: {_e}")
+
+
+def _persist_marker() -> Path:
+    return DB_DIR / ".persist_marker"
+
+
+def _check_persistence() -> bool:
+    m = _persist_marker()
+    now = str(int(time.time()))
+    try:
+        prev = m.read_text().strip() if m.exists() else None
+        m.write_text(now)
+        return prev is not None
+    except Exception:
+        return False
+
+
+def _wal_checkpoint(passive: bool = False) -> None:
+    if not DB_FILE.exists():
+        return
+    try:
+        with sqlite3.connect(str(DB_FILE), timeout=10.0) as c:
+            c.execute("PRAGMA busy_timeout=5000;")
+            mode = "PASSIVE" if passive else "TRUNCATE"
+            c.execute(f"PRAGMA wal_checkpoint({mode});")
+    except Exception:
+        pass
+
+
+def _backup_rotate(keep: int = 5) -> None:
+    if not DB_FILE.exists():
+        return
+    try:
+        _wal_checkpoint()
+    except Exception:
+        pass
+
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    for suffix in ("", "-wal", "-shm"):
+        src = Path(str(DB_FILE) + suffix)
+        if not src.exists():
+            continue
+        dst = Path(str(DB_FILE) + f".{ts}.bak{suffix}")
+        try:
+            shutil.copy2(src, dst)
+        except Exception:
+            pass
+
+    try:
+        for suffix in ("", "-wal", "-shm"):
+            pattern = DB_FILE.name + ".*.bak" + suffix
+            files = sorted(
+                DB_DIR.glob(pattern),
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )
+            for old in files[keep:]:
+                try:
+                    old.unlink()
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+
+_persist_ok = _check_persistence()
+
 log.info("Config loaded | cwd=%s | admin_chat=%s | target_chat=%s | thread=%s | appeal_thread=%s",
          Path.cwd(), ADMIN_CHAT_ID, TARGET_CHAT_ID, TOPIC_THREAD_ID, APPEAL_THREAD_ID)
+log.info("DB path → %s (dir=%s, persist=%s)",
+         DB_FILE, DB_DIR, "yes" if _persist_ok else "NEW/UNKNOWN")
+if not _persist_ok:
+    log.warning(
+        "Маркер персистентности отсутствует — первый запуск либо volume НЕ сохраняется."
+    )
 
 
 SLOT_STATES = ("new", "awaiting_form", "awaiting_video")
@@ -160,6 +246,16 @@ _queue_positions: dict[int, int] = {}
 _queue_last_shown: dict[int, float] = {}
 _queue_notify_at: dict[int, float] = {}
 _notify_task: Optional[asyncio.Task] = None
+
+_restart_event: Optional[asyncio.Event] = None
+_watchdog_fails = 0
+
+
+def _request_restart(reason: str = "") -> None:
+    global _restart_event
+    if _restart_event is not None and not _restart_event.is_set():
+        log.warning("restart requested: %s", reason)
+        _restart_event.set()
 
 
 async def _try_acquire_slot(user_id: int) -> tuple[bool, int]:
@@ -278,20 +374,67 @@ def _schedule_queue_notify() -> None:
     _notify_task = asyncio.create_task(_notify_queue_positions())
 
 
-async def _cleanup_stale_sessions() -> None:
+_last_seen: dict[int, float] = defaultdict(float)
+_last_ping: dict[int, float] = defaultdict(float)
+_last_cb: dict[int, float] = defaultdict(float)
+
+
+def _gc_throttle_dicts() -> None:
+    now = time.monotonic()
+    for d, ttl in (
+        (_last_seen, THROTTLE_SECONDS * 20),
+        (_last_ping, PING_COOLDOWN_SECONDS),
+        (_last_cb, 120.0),
+    ):
+        for k in [k for k, v in d.items() if now - v > ttl]:
+            d.pop(k, None)
+
+
+async def _housekeeping() -> None:
     while True:
-        await asyncio.sleep(60)
-        now = time.monotonic()
-        stale: list[int] = []
-        async with _queue_lock:
-            for uid, ts in list(_active_sessions.items()):
-                if now - ts > SESSION_TIMEOUT:
-                    stale.append(uid)
-                    _active_sessions.pop(uid, None)
-        if stale:
-            log.info("Освобождено %d устаревших сессий (бездействие > %.0f сек): %s",
-                     len(stale), SESSION_TIMEOUT, stale)
-            await _advance_queue()
+        await asyncio.sleep(GC_INTERVAL)
+        try:
+            now = time.monotonic()
+            stale: list[int] = []
+            async with _queue_lock:
+                for uid, ts in list(_active_sessions.items()):
+                    if now - ts > SESSION_TIMEOUT:
+                        stale.append(uid)
+                        _active_sessions.pop(uid, None)
+            if stale:
+                log.info("Освобождено %d устаревших сессий: %s", len(stale), stale)
+                await _advance_queue()
+
+            _gc_throttle_dicts()
+
+            try:
+                _wal_checkpoint(passive=True)
+            except Exception:
+                pass
+
+            try:
+                cutoff_days = int(MESSAGES_RETENTION_DAYS)
+                if cutoff_days > 0:
+                    await db_exec(
+                        "DELETE FROM applications WHERE status IN ('approved','rejected') "
+                        "AND created_at < datetime('now', ?)",
+                        (f"-{cutoff_days} days",),
+                    )
+                    await db_exec(
+                        "DELETE FROM appeals WHERE status IN ('approved','rejected','new_link') "
+                        "AND created_at < datetime('now', ?)",
+                        (f"-{cutoff_days} days",),
+                    )
+            except Exception as e:
+                log.debug("housekeeping retention: %s", e)
+
+            try:
+                gc.collect()
+            except Exception:
+                pass
+
+        except Exception as e:
+            log.debug("housekeeping loop err: %s", e)
 
 
 def _queue_text(pos: int) -> str:
@@ -494,8 +637,12 @@ CREATE INDEX IF NOT EXISTS idx_invite_links_link
 
 
 def _sync_init_db() -> None:
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(str(DB_FILE), timeout=30.0)
     try:
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA synchronous=NORMAL;")
+        conn.execute("PRAGMA busy_timeout=10000;")
+        conn.execute("PRAGMA wal_autocheckpoint=1000;")
         conn.executescript(SCHEMA)
 
         u_cols = {row[1] for row in conn.execute("PRAGMA table_info(users)")}
@@ -518,18 +665,30 @@ def _sync_init_db() -> None:
 
 
 def _sync_exec(query: str, params: tuple = (), fetch: Optional[str] = None):
-    conn = sqlite3.connect(DB_PATH, timeout=30.0)
-    try:
-        conn.row_factory = sqlite3.Row
-        cur = conn.execute(query, params)
-        if fetch == "one":
-            return cur.fetchone()
-        if fetch == "all":
-            return cur.fetchall()
-        conn.commit()
-        return cur.lastrowid
-    finally:
-        conn.close()
+    last_err = None
+    for attempt in range(4):
+        try:
+            conn = sqlite3.connect(str(DB_FILE), timeout=30.0)
+            try:
+                conn.execute("PRAGMA busy_timeout=10000;")
+                conn.row_factory = sqlite3.Row
+                cur = conn.execute(query, params)
+                if fetch == "one":
+                    return cur.fetchone()
+                if fetch == "all":
+                    return cur.fetchall()
+                conn.commit()
+                return cur.lastrowid
+            finally:
+                conn.close()
+        except sqlite3.OperationalError as e:
+            last_err = e
+            if "locked" in str(e).lower() and attempt < 3:
+                time.sleep(0.15 * (attempt + 1))
+                continue
+            raise
+    if last_err:
+        raise last_err
 
 
 async def db_exec(query: str, params: tuple = (), fetch: Optional[str] = None):
@@ -872,11 +1031,6 @@ def parse_appeal(text: str) -> Optional[dict]:
         "punishment_type": data["punishment_type"].strip(),
         "description": data["description"].strip(),
     }
-
-
-_last_seen: dict[int, float] = defaultdict(float)
-_last_ping: dict[int, float] = defaultdict(float)
-_last_cb: dict[int, float] = defaultdict(float)
 
 
 def is_throttled(user_id: int) -> bool:
@@ -2183,7 +2337,7 @@ async def _post_init(app: Application) -> None:
         ])
     except Exception as e:
         log.warning("set_my_commands failed: %s", e)
-    asyncio.create_task(_cleanup_stale_sessions())
+    asyncio.create_task(_housekeeping())
 
 
 async def _error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2259,7 +2413,12 @@ async def _start_with_retry() -> Application:
             log.info("Подключение к Telegram (попытка %d)…", attempt)
             await app.initialize()
             await app.start()
-            await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
+            await app.updater.start_polling(
+                allowed_updates=Update.ALL_TYPES,
+                drop_pending_updates=True,
+                poll_interval=1.0,
+                timeout=30,
+            )
             log.info("Bot running. App thread: %s. Appeal thread: %s. Target chat: %s. "
                      "Slot limit: %d, session timeout: %.0f сек.",
                      TOPIC_THREAD_ID, APPEAL_THREAD_ID, TARGET_CHAT_ID,
@@ -2278,27 +2437,52 @@ async def _start_with_retry() -> Application:
             raise
 
 
-async def _watchdog(app: Application, stop_event: asyncio.Event,
-                    interval: float = 30.0) -> None:
-    while not stop_event.is_set():
+async def _watchdog(app: Application) -> None:
+    global _watchdog_fails
+    while True:
         try:
-            await asyncio.wait_for(stop_event.wait(), timeout=interval)
-            return
-        except asyncio.TimeoutError:
-            pass
+            try:
+                await asyncio.wait_for(app.bot.get_me(), timeout=25)
+            except Exception as e:
+                _watchdog_fails += 1
+                log.warning("watchdog: getMe fail (%d/%d): %s",
+                            _watchdog_fails, WATCHDOG_MAX_FAILS, e)
+                if _watchdog_fails >= WATCHDOG_MAX_FAILS:
+                    _request_restart(
+                        f"{_watchdog_fails} getMe фейлов подряд"
+                    )
+                    return
+            else:
+                _watchdog_fails = 0
+                if app.updater is None or not app.updater.running:
+                    _request_restart("updater.running = False")
+                    return
+                log.debug("watchdog: alive. Активных сессий: %d, в очереди: %d",
+                          len(_active_sessions), len(_queue_order))
+        except Exception as e:
+            log.debug("watchdog loop err: %s", e)
+        await asyncio.sleep(WATCHDOG_INTERVAL)
 
-        updater = app.updater
-        if updater is None or not updater.running:
-            log.error("Watchdog: polling упал — инициирую перезапуск.")
-            stop_event.set()
-            return
-        log.debug("Watchdog: polling живой, ОК. Активных сессий: %d, в очереди: %d",
-                  len(_active_sessions), len(_queue_order))
+
+async def _shutdown_app(app: Application) -> None:
+    log.info("shutting down app…")
+    steps = []
+    if app.updater is not None:
+        steps.append(app.updater.stop)
+    steps.append(app.stop)
+    steps.append(app.shutdown)
+    for step in steps:
+        try:
+            await step()
+        except Exception as e:
+            log.debug("shutdown step: %s", e)
+    log.info("app shut down.")
 
 
 async def _run_bot_once() -> None:
     global _active_sessions, _queue_order, _queue_bots
     global _queue_positions, _queue_last_shown, _queue_notify_at, _notify_task
+    global _restart_event, _watchdog_fails
 
     _active_sessions = {}
     _queue_order = []
@@ -2307,16 +2491,14 @@ async def _run_bot_once() -> None:
     _queue_last_shown = {}
     _queue_notify_at = {}
     _notify_task = None
+    _restart_event = asyncio.Event()
+    _watchdog_fails = 0
 
     app = await _start_with_retry()
-
-    stop_event = asyncio.Event()
-    watchdog_task = asyncio.create_task(
-        _watchdog(app, stop_event, interval=WATCHDOG_INTERVAL)
-    )
+    watchdog_task = asyncio.create_task(_watchdog(app))
 
     try:
-        await stop_event.wait()
+        await _restart_event.wait()
     except (KeyboardInterrupt, SystemExit):
         pass
     finally:
@@ -2327,13 +2509,11 @@ async def _run_bot_once() -> None:
             pass
         if _notify_task is not None and not _notify_task.done():
             _notify_task.cancel()
-        log.info("Shutting down app…")
-        for step in (app.updater.stop, app.stop, app.shutdown):
-            try:
-                await step()
-            except Exception as e:
-                log.warning("Ошибка при остановке (%s): %s",
-                            getattr(step, "__name__", step), e)
+        await _shutdown_app(app)
+        try:
+            await asyncio.to_thread(_wal_checkpoint)
+        except Exception:
+            pass
 
 
 async def _run_bot() -> None:
@@ -2354,6 +2534,10 @@ async def _run_bot() -> None:
 
 
 def main() -> None:
+    try:
+        _backup_rotate(keep=5)
+    except Exception as e:
+        log.warning("backup rotate failed: %s", e)
     _sync_init_db()
     log.info("Bot starting…")
     try:
