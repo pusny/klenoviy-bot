@@ -264,8 +264,7 @@ async def _try_acquire_slot(user_id: int) -> tuple[bool, int]:
 
 async def _queue_set_bot(user_id: int, bot) -> None:
     async with _queue_lock:
-        if user_id in _queue_order:
-            _queue_bots[user_id] = bot
+        _queue_bots[user_id] = bot
 
 
 async def _release_slot(user_id: int) -> None:
@@ -282,20 +281,31 @@ async def _release_slot(user_id: int) -> None:
 
 async def _advance_queue() -> None:
     promoted = False
+    rotated_without_bot = 0
     while True:
         async with _queue_lock:
             if not _queue_order or len(_active_sessions) >= SOFT_PARALLEL_LIMIT:
                 break
-            next_uid = _queue_order.pop(0)
-            next_bot = _queue_bots.pop(next_uid, None)
+
+            if rotated_without_bot >= len(_queue_order):
+                break
+
+            next_uid = _queue_order[0]
+            next_bot = _queue_bots.get(next_uid)
+            if next_bot is None:
+                _queue_order.pop(0)
+                _queue_order.append(next_uid)
+                rotated_without_bot += 1
+                continue
+
+            _queue_order.pop(0)
+            rotated_without_bot = 0
+            _queue_bots.pop(next_uid, None)
             _active_sessions[next_uid] = time.monotonic()
             _queue_positions.pop(next_uid, None)
             _queue_last_shown.pop(next_uid, None)
             _queue_notify_at.pop(next_uid, None)
             promoted = True
-
-        if next_bot is None:
-            continue
 
         try:
             db_user = await get_user(next_uid)
@@ -1291,6 +1301,13 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if state in SLOT_STATES:
         got_slot, pos = await _try_acquire_slot(user.id)
         if not got_slot:
+            await _queue_set_bot(user.id, ctx.bot)
+            await _advance_queue()
+
+            if user.id in _active_sessions:
+                log.info("User %s промоутнут из очереди сразу после /start", user.id)
+                return
+
             now = time.monotonic()
             last_pos = _queue_positions.get(user.id, 0)
             last_shown = _queue_last_shown.get(user.id, 0.0)
@@ -1300,7 +1317,6 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                          user.id, pos)
                 return
 
-            await _queue_set_bot(user.id, ctx.bot)
             await _queue_notify_one(ctx.bot, user.id, pos)
             log.info("User %s в очереди, позиция %d (state=%s)", user.id, pos, state)
             return
@@ -2249,7 +2265,7 @@ async def cb_appeal_reject(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
             "❌ <b>В апелляции отказано</b>\n\n"
             f"Вы не можете подать апелляцию в течение {APPEAL_BLOCK_DAYS} дней.\n\n"
             f"🕒 <b>Блокировка снимется:</b> {_pretty_dt(until_str)}\n\n"
-            "<i>Когда срок истечёт — напишите /start, чтобы подать апелляцию снова.</i>"
+            "<i>Когда срок истёчёт — напишите /start, чтобы подать апелляцию снова.</i>"
         ),
         parse_mode=ParseMode.HTML,
     )
