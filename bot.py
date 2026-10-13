@@ -1523,13 +1523,14 @@ async def cb_ping_admins(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
 def _build_admin_text(app_row, tg_user) -> str:
     username = tg_user.username
     user_id = tg_user.id
-    first_name = tg_user.first_name or "—"
+    first_name = (tg_user.first_name or "").strip()
 
     username_display = f"@{esc(username)}" if username else "без username"
     safe_name = esc(app_row["name"])
     about_value = esc(app_row["about"]) if app_row["about"] else "—"
 
-    mention = f'<a href="tg://user?id={user_id}">{esc(first_name)}</a>'
+    anchor = esc(first_name) if first_name else "Открыть профиль"
+    mention = f'<a href="tg://user?id={user_id}">{anchor}</a>'
 
     return (
         "📩 <b>Новая заявка</b>\n\n"
@@ -1551,10 +1552,11 @@ def _build_admin_text(app_row, tg_user) -> str:
 def _build_appeal_admin_text(appeal_row, tg_user) -> str:
     username = tg_user.username
     user_id = tg_user.id
-    first_name = tg_user.first_name or "—"
+    first_name = (tg_user.first_name or "").strip()
 
     username_display = f"@{esc(username)}" if username else "без username"
-    mention = f'<a href="tg://user?id={user_id}">{esc(first_name)}</a>'
+    anchor = esc(first_name) if first_name else "Открыть профиль"
+    mention = f'<a href="tg://user?id={user_id}">{anchor}</a>'
 
     return (
         "⚖️ <b>Новая апелляция</b>\n\n"
