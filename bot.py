@@ -74,8 +74,10 @@ TARGET_CHAT_ID   = _req_int("TARGET_CHAT_ID")
 CHAT_INVITE_LINK = _opt("CHAT_INVITE_LINK", "")
 RULES_LINK       = _req("RULES_LINK")
 
-TOPIC_THREAD_ID: Optional[int]  = _opt_int("TOPIC_THREAD_ID", None)
-APPEAL_THREAD_ID: Optional[int] = _opt_int("APPEAL_THREAD_ID", None)
+TOPIC_THREAD_ID:      Optional[int] = _opt_int("TOPIC_THREAD_ID", None)
+APPEAL_THREAD_ID:     Optional[int] = _opt_int("APPEAL_THREAD_ID", None)
+MODERATOR_THREAD_ID:  Optional[int] = _opt_int("MODERATOR_THREAD_ID", None)
+MOD_APPROVED_CHAT_ID: Optional[int] = _opt_int("MOD_APPROVED_CHAT_ID", None)
 
 _data_dir = (os.getenv("DATA_DIR") or "").strip()
 if _data_dir:
@@ -215,8 +217,9 @@ def _backup_rotate(keep: int = 5) -> None:
 
 _persist_ok = _check_persistence()
 
-log.info("Config loaded | cwd=%s | admin_chat=%s | target_chat=%s | thread=%s | appeal_thread=%s",
-         Path.cwd(), ADMIN_CHAT_ID, TARGET_CHAT_ID, TOPIC_THREAD_ID, APPEAL_THREAD_ID)
+log.info("Config loaded | cwd=%s | admin_chat=%s | target_chat=%s | thread=%s | appeal_thread=%s | mod_thread=%s | mod_chat=%s",
+         Path.cwd(), ADMIN_CHAT_ID, TARGET_CHAT_ID, TOPIC_THREAD_ID, APPEAL_THREAD_ID,
+         MODERATOR_THREAD_ID, MOD_APPROVED_CHAT_ID)
 log.info("DB path → %s (dir=%s, persist=%s)",
          DB_FILE, DB_DIR, "yes" if _persist_ok else "NEW/UNKNOWN")
 if not _persist_ok:
@@ -420,6 +423,11 @@ async def _housekeeping() -> None:
                         "AND created_at < datetime('now', ?)",
                         (f"-{cutoff_days} days",),
                     )
+                    await db_exec(
+                        "DELETE FROM moderator_applications WHERE status IN ('approved','rejected') "
+                        "AND created_at < datetime('now', ?)",
+                        (f"-{cutoff_days} days",),
+                    )
             except Exception as e:
                 log.debug("housekeeping retention: %s", e)
 
@@ -484,6 +492,18 @@ def _appeal_topic_kwargs() -> dict:
     if APPEAL_THREAD_ID:
         return {"message_thread_id": APPEAL_THREAD_ID}
     return {}
+
+
+def _mod_topic_kwargs() -> dict:
+    if MODERATOR_THREAD_ID:
+        return {"message_thread_id": MODERATOR_THREAD_ID}
+    if TOPIC_THREAD_ID:
+        return {"message_thread_id": TOPIC_THREAD_ID}
+    return {}
+
+
+def _mod_chat_id() -> int:
+    return MOD_APPROVED_CHAT_ID or ADMIN_CHAT_ID
 
 
 async def send_msg(bot, chat_id: int, *, text: str, **kwargs):
@@ -561,6 +581,7 @@ CREATE TABLE IF NOT EXISTS users (
     first_name       TEXT,
     state            TEXT NOT NULL DEFAULT 'new',
     pre_appeal_state TEXT,
+    mod_state        TEXT,
     created_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
@@ -626,6 +647,49 @@ CREATE INDEX IF NOT EXISTS idx_invite_links_user
 
 CREATE INDEX IF NOT EXISTS idx_invite_links_link
     ON invite_links (invite_link);
+
+CREATE TABLE IF NOT EXISTS moderator_recruitment (
+    id               INTEGER PRIMARY KEY CHECK (id = 1),
+    is_open          INTEGER NOT NULL DEFAULT 0,
+    round_started_at TIMESTAMP,
+    opened_at        TIMESTAMP,
+    closed_at        TIMESTAMP,
+    opened_by        INTEGER,
+    closed_by        INTEGER
+);
+
+INSERT OR IGNORE INTO moderator_recruitment (id, is_open) VALUES (1, 0);
+
+CREATE TABLE IF NOT EXISTS moderator_applications (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id              INTEGER NOT NULL,
+    round_started_at     TIMESTAMP NOT NULL,
+    username_at_submit   TEXT,
+    first_name_at_submit TEXT,
+    name                 TEXT NOT NULL,
+    age                  TEXT NOT NULL,
+    about                TEXT NOT NULL,
+    motivation           TEXT NOT NULL,
+    video_note_file_id   TEXT,
+    status               TEXT NOT NULL DEFAULT 'pending',
+    admin_msg_id         INTEGER,
+    video_admin_msg_id   INTEGER,
+    created_at           TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    decided_by           INTEGER,
+    decided_at           TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_mod_apps_user_round
+    ON moderator_applications (user_id, round_started_at);
+
+CREATE TABLE IF NOT EXISTS moderator_responses (
+    user_id          INTEGER NOT NULL,
+    round_started_at TIMESTAMP NOT NULL,
+    notified         INTEGER NOT NULL DEFAULT 0,
+    refused          INTEGER NOT NULL DEFAULT 0,
+    applied          INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (user_id, round_started_at)
+);
 """
 
 
@@ -640,6 +704,8 @@ def _sync_init_db() -> None:
         u_cols = {row[1] for row in conn.execute("PRAGMA table_info(users)")}
         if "pre_appeal_state" not in u_cols:
             conn.execute("ALTER TABLE users ADD COLUMN pre_appeal_state TEXT")
+        if "mod_state" not in u_cols:
+            conn.execute("ALTER TABLE users ADD COLUMN mod_state TEXT")
 
         cols = {row[1] for row in conn.execute("PRAGMA table_info(applications)")}
         if "video_note_file_id" not in cols:
@@ -714,6 +780,13 @@ async def set_user_state(user_id: int, state: str) -> None:
 async def set_pre_appeal_state(user_id: int, state: Optional[str]) -> None:
     await db_exec(
         "UPDATE users SET pre_appeal_state = ?, updated_at = CURRENT_TIMESTAMP WHERE user_id = ?",
+        (state, user_id),
+    )
+
+
+async def set_mod_state(user_id: int, state: Optional[str]) -> None:
+    await db_exec(
+        "UPDATE users SET mod_state = ?, updated_at = CURRENT_TIMESTAMP WHERE user_id = ?",
         (state, user_id),
     )
 
@@ -935,6 +1008,225 @@ async def mark_invite_used(user_id: int) -> None:
     )
 
 
+async def get_recruitment():
+    return await db_exec(
+        "SELECT * FROM moderator_recruitment WHERE id = 1",
+        fetch="one",
+    )
+
+
+async def open_recruitment(admin_id: int) -> bool:
+    rec = await get_recruitment()
+    if rec and int(rec["is_open"]) == 1:
+        return False
+    now_ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    await db_exec(
+        """
+        INSERT INTO moderator_recruitment
+            (id, is_open, round_started_at, opened_at, opened_by)
+        VALUES (1, 1, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+            is_open = 1,
+            round_started_at = excluded.round_started_at,
+            opened_at = excluded.opened_at,
+            opened_by = excluded.opened_by,
+            closed_at = NULL,
+            closed_by = NULL
+        """,
+        (now_ts, now_ts, admin_id),
+    )
+    return True
+
+
+async def close_recruitment(admin_id: int) -> bool:
+    rec = await get_recruitment()
+    if not rec or int(rec["is_open"]) == 0:
+        return False
+    now_ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    await db_exec(
+        "UPDATE moderator_recruitment SET is_open = 0, closed_at = ?, closed_by = ? "
+        "WHERE id = 1",
+        (now_ts, admin_id),
+    )
+    return True
+
+
+async def get_mod_response(user_id: int, round_started_at: str):
+    return await db_exec(
+        "SELECT * FROM moderator_responses WHERE user_id = ? AND round_started_at = ?",
+        (user_id, round_started_at), fetch="one",
+    )
+
+
+async def mark_mod_notified(user_id: int, round_started_at: str) -> None:
+    await db_exec(
+        """
+        INSERT OR IGNORE INTO moderator_responses
+            (user_id, round_started_at, notified)
+        VALUES (?, ?, 1)
+        """,
+        (user_id, round_started_at),
+    )
+
+
+async def mark_mod_refused(user_id: int, round_started_at: str) -> None:
+    await db_exec(
+        """
+        INSERT INTO moderator_responses
+            (user_id, round_started_at, notified, refused)
+        VALUES (?, ?, 1, 1)
+        ON CONFLICT(user_id, round_started_at) DO UPDATE SET refused = 1
+        """,
+        (user_id, round_started_at),
+    )
+
+
+async def mark_mod_applied(user_id: int, round_started_at: str) -> None:
+    await db_exec(
+        """
+        INSERT INTO moderator_responses
+            (user_id, round_started_at, notified, applied)
+        VALUES (?, ?, 1, 1)
+        ON CONFLICT(user_id, round_started_at) DO UPDATE SET applied = 1
+        """,
+        (user_id, round_started_at),
+    )
+
+
+async def get_approved_users_ids() -> list[int]:
+    rows = await db_exec(
+        "SELECT user_id FROM users WHERE state = 'approved'",
+        fetch="all",
+    )
+    return [int(r["user_id"]) for r in rows] if rows else []
+
+
+async def get_notified_users_ids(round_started_at: str) -> list[int]:
+    rows = await db_exec(
+        "SELECT user_id FROM moderator_responses WHERE round_started_at = ? AND notified = 1",
+        (round_started_at,), fetch="all",
+    )
+    return [int(r["user_id"]) for r in rows] if rows else []
+
+
+async def has_pending_mod_application(user_id: int) -> bool:
+    row = await db_exec(
+        "SELECT 1 FROM moderator_applications "
+        "WHERE user_id = ? AND status = 'pending' LIMIT 1",
+        (user_id,), fetch="one",
+    )
+    return row is not None
+
+
+async def has_active_mod_application(user_id: int) -> bool:
+    row = await db_exec(
+        "SELECT 1 FROM moderator_applications "
+        "WHERE user_id = ? AND status IN ('pending', 'awaiting_video') LIMIT 1",
+        (user_id,), fetch="one",
+    )
+    return row is not None
+
+
+async def has_approved_mod_application(user_id: int) -> bool:
+    row = await db_exec(
+        "SELECT 1 FROM moderator_applications "
+        "WHERE user_id = ? AND status = 'approved' LIMIT 1",
+        (user_id,), fetch="one",
+    )
+    return row is not None
+
+
+async def create_mod_application(
+    user_id: int,
+    round_started_at: str,
+    username_at_submit: Optional[str],
+    first_name_at_submit: Optional[str],
+    name: str,
+    age: str,
+    about: str,
+    motivation: str,
+    status: str = "awaiting_video",
+) -> int:
+    return await db_exec(
+        """
+        INSERT INTO moderator_applications
+            (user_id, round_started_at, username_at_submit, first_name_at_submit,
+             name, age, about, motivation, status, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        """,
+        (user_id, round_started_at, username_at_submit, first_name_at_submit,
+         name, age, about, motivation, status),
+    )
+
+
+async def get_mod_application(app_id: int):
+    return await db_exec(
+        "SELECT * FROM moderator_applications WHERE id = ?",
+        (app_id,), fetch="one",
+    )
+
+
+async def get_latest_mod_application(user_id: int):
+    return await db_exec(
+        "SELECT * FROM moderator_applications WHERE user_id = ? ORDER BY id DESC LIMIT 1",
+        (user_id,), fetch="one",
+    )
+
+
+async def set_mod_video_note(app_id: int, file_id: str) -> None:
+    await db_exec(
+        "UPDATE moderator_applications SET video_note_file_id = ? WHERE id = ?",
+        (file_id, app_id),
+    )
+
+
+async def set_mod_application_status(app_id: int, status: str) -> None:
+    await db_exec(
+        "UPDATE moderator_applications SET status = ? WHERE id = ?",
+        (status, app_id),
+    )
+
+
+async def set_mod_admin_msg_id(app_id: int, msg_id: int) -> None:
+    await db_exec(
+        "UPDATE moderator_applications SET admin_msg_id = ? WHERE id = ?",
+        (msg_id, app_id),
+    )
+
+
+async def set_mod_video_admin_msg_id(app_id: int, msg_id: int) -> None:
+    await db_exec(
+        "UPDATE moderator_applications SET video_admin_msg_id = ? WHERE id = ?",
+        (msg_id, app_id),
+    )
+
+
+async def try_decide_mod_application(app_id: int, status: str, decided_by: int) -> bool:
+    row = await db_exec(
+        """
+        UPDATE moderator_applications
+        SET status = ?, decided_by = ?, decided_at = CURRENT_TIMESTAMP
+        WHERE id = ? AND status = 'pending'
+        RETURNING id
+        """,
+        (status, decided_by, app_id), fetch="one",
+    )
+    return row is not None
+
+
+async def reset_stuck_mod_states() -> int:
+    row = await db_exec(
+        """
+        UPDATE users
+        SET mod_state = NULL, updated_at = CURRENT_TIMESTAMP
+        WHERE mod_state IN ('mod_awaiting_form', 'mod_awaiting_video')
+        RETURNING user_id
+        """,
+        fetch="all",
+    )
+    return len(row) if row else 0
+
+
 REQUIRED_FIELDS = ("name", "age", "diseases", "reason")
 
 FIELD_PATTERNS = {
@@ -952,6 +1244,15 @@ APPEAL_FIELD_PATTERNS = {
     "age":             r"возраст",
     "punishment_type": r"тип\s+наказания",
     "description":     r"краткое\s+описание",
+}
+
+MOD_REQUIRED_FIELDS = ("name", "age", "about", "motivation")
+
+MOD_FIELD_PATTERNS = {
+    "name":       r"имя",
+    "age":        r"возраст",
+    "about":      r"о\s+себе(?:\s*\(\s*кто\s+вы\s*\))?",
+    "motivation": r"мотивация(?:\s*\(\s*зачем\s+и\s+почему\s*\))?",
 }
 
 
@@ -1028,6 +1329,18 @@ def parse_appeal(text: str) -> Optional[dict]:
     }
 
 
+def parse_mod_form(text: str) -> Optional[dict]:
+    data = _parse_fields(text, MOD_FIELD_PATTERNS, MOD_REQUIRED_FIELDS)
+    if data is None:
+        return None
+    return {
+        "name": data["name"].strip(),
+        "age": data["age"].strip(),
+        "about": data["about"].strip(),
+        "motivation": data["motivation"].strip(),
+    }
+
+
 def is_throttled(user_id: int) -> bool:
     now = time.monotonic()
     if now - _last_seen[user_id] < THROTTLE_SECONDS:
@@ -1097,6 +1410,27 @@ def appeal_decision_keyboard(appeal_id: int) -> InlineKeyboardMarkup:
         [
             InlineKeyboardButton("🔁 Выдать новую ссылку", callback_data=f"appeal_newlink:{appeal_id}"),
         ],
+        [
+            InlineKeyboardButton("🛡 Выдать ссылку на админ-чат", callback_data=f"appeal_modlink:{appeal_id}"),
+        ],
+    ])
+
+
+def mod_invite_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🛡 Подать заявку", callback_data="mod_apply"),
+            InlineKeyboardButton("❌ Отказаться", callback_data="mod_refuse"),
+        ]
+    ])
+
+
+def mod_decision_keyboard(app_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ Принять", callback_data=f"mod_approve:{app_id}"),
+            InlineKeyboardButton("❌ Отклонить", callback_data=f"mod_reject:{app_id}"),
+        ]
     ])
 
 
@@ -1189,6 +1523,80 @@ APPEAL_WAITING_TEXT = (
     "Если ответа нет долго — нажмите кнопку ниже."
 )
 
+MOD_OPEN_TEXT = (
+    "🛡 <b>Набор модераторов открыт!</b>\n\n"
+    "Администрация чата открыла набор модераторов.\n\n"
+    "Если хотите попробовать — нажмите «Подать заявку».\n\n"
+    "<i>Если нажмёте «Отказаться» — заявку в этом наборе подать уже не сможете. "
+    "Следующая возможность будет только когда администрация откроет новый набор.</i>"
+)
+
+MOD_FORM_TEXT = (
+    "🛡 <b>Заявка на модератора</b>\n\n"
+    "Скопируйте шаблон ниже — <i>тап по тексту = копирование</i>.\n"
+    "Заполните все поля и отправьте <b>одним сообщением</b>.\n\n"
+    "━━━━━━━━━━━━━━━━━━━━\n"
+    "<code>"
+    "Имя: \n"
+    "Возраст: \n"
+    "О себе (кто вы): \n"
+    "Мотивация (зачем и почему): "
+    "</code>\n"
+    "━━━━━━━━━━━━━━━━━━━━\n\n"
+    "<i>Обязательные поля: Имя, Возраст, О себе, Мотивация.</i>"
+)
+
+MOD_INVALID_FORM_TEXT = (
+    "❌ <b>Анкета оформлена не по шаблону</b>\n\n"
+    "Скопируйте шаблон из сообщения выше, заполните все обязательные поля "
+    "и отправьте <b>одним сообщением</b>."
+)
+
+MOD_VIDEO_REQUEST_TEXT = (
+    "🎥 <b>Видео-подтверждение</b>\n\n"
+    "Запишите <b>видео-кружок</b> (до 60 секунд), в котором коротко "
+    "представитесь и подтвердите, что вы реальный человек.\n\n"
+    "Значок 🎥 — <b>справа</b> от поля ввода, рядом с кнопкой отправки. "
+    "Обычное видео или фото не подойдут."
+)
+
+MOD_VIDEO_REMINDER_TEXT = (
+    "⚠️ <b>Нужен именно видео-кружок</b>\n\n"
+    "Нажмите 🎥 <b>справа</b> от поля ввода и запишите короткое видео до 60 секунд."
+)
+
+MOD_WAITING_TEXT = (
+    "⏳ <b>Заявка на модератора отправлена</b>\n\n"
+    "Администрация рассмотрит её и сообщит решение."
+)
+
+MOD_REFUSED_TEXT = (
+    "❌ Вы отказались от подачи заявки на модератора.\n\n"
+    "В этом наборе заявку подать уже нельзя. "
+    "Следующая возможность — когда администрация снова откроет набор."
+)
+
+MOD_CLOSED_TEXT = (
+    "📪 <b>Набор модераторов закрыт</b>\n\n"
+    "Администрация закрыла набор. Спасибо всем, кто откликнулся!"
+)
+
+MOD_APPROVED_MSG = (
+    "✅ <b>Ваша заявка на модератора принята!</b>\n\n"
+    "🛡 Добро пожаловать в команду."
+)
+
+MOD_APPROVED_MSG_NO_LINK = (
+    "✅ <b>Ваша заявка на модератора принята!</b>\n\n"
+    "🛡 Добро пожаловать в команду.\n\n"
+    "Ссылку на админ-чат вам выдаст администратор."
+)
+
+MOD_REJECTED_MSG = (
+    "❌ <b>Заявка на модератора отклонена</b>\n\n"
+    "Спасибо за проявленный интерес."
+)
+
 
 async def _send_appeal_form(bot, user_id: int) -> None:
     await send_msg(bot, user_id, text=APPEAL_FORM_TEXT, parse_mode=ParseMode.HTML)
@@ -1234,6 +1642,37 @@ async def _generate_invite_link(bot, user_id: int) -> Optional[str]:
         return link
     except Exception as e2:
         log.error("create_chat_invite_link failed for %s: %s", user_id, e2)
+        return None
+
+
+async def _generate_mod_chat_invite(bot, user_id: int) -> Optional[str]:
+    expire_at = datetime.now(timezone.utc) + timedelta(hours=1)
+    chat_id = _mod_chat_id()
+
+    try:
+        invite = await bot.create_chat_invite_link(
+            chat_id=chat_id,
+            member_limit=1,
+            creates_join_request=True,
+            expire_date=expire_at,
+            name=f"mod_u{user_id}",
+        )
+        log.info("Mod chat invite (limit+request) for %s: %s", user_id, invite.invite_link)
+        return invite.invite_link
+    except Exception as e:
+        log.warning("mod invite limit+request failed (%s), retry plain", e)
+
+    try:
+        invite = await bot.create_chat_invite_link(
+            chat_id=chat_id,
+            member_limit=1,
+            expire_date=expire_at,
+            name=f"mod_u{user_id}",
+        )
+        log.info("Mod chat invite (plain) for %s: %s", user_id, invite.invite_link)
+        return invite.invite_link
+    except Exception as e2:
+        log.error("mod invite failed for %s: %s", user_id, e2)
         return None
 
 
@@ -1574,6 +2013,31 @@ def _build_appeal_admin_text(appeal_row, tg_user) -> str:
     )
 
 
+def _build_mod_admin_text(app_row, tg_user) -> str:
+    username = tg_user.username
+    user_id = tg_user.id
+    first_name = (tg_user.first_name or "").strip()
+
+    username_display = f"@{esc(username)}" if username else "без username"
+    anchor = esc(first_name) if first_name else "Открыть профиль"
+    mention = f'<a href="tg://user?id={user_id}">{anchor}</a>'
+
+    return (
+        "🛡 <b>Новая заявка на модератора</b>\n\n"
+        f"👤 <b>Отправитель:</b> {username_display} ({esc(app_row['name'])})\n"
+        f"🆔 <b>user_id:</b> <code>{user_id}</code>\n"
+        f"🔗 <b>Профиль:</b> {mention}\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "📋 <b>Анкета:</b>\n\n"
+        f"<b>Имя:</b> {esc(app_row['name'])}\n"
+        f"<b>Возраст:</b> {esc(app_row['age'])}\n"
+        f"<b>О себе:</b> {esc(app_row['about'])}\n"
+        f"<b>Мотивация:</b> {esc(app_row['motivation'])}\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        f"🕒 <b>Отправлено:</b> {app_row['created_at']}"
+    )
+
+
 async def on_user_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
     user = update.effective_user
@@ -1597,6 +2061,58 @@ async def on_user_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     state = db_user["state"]
+    mod_state = db_user["mod_state"]
+
+    if mod_state == "mod_awaiting_form":
+        rec = await get_recruitment()
+        if not rec or int(rec["is_open"]) == 0:
+            await set_mod_state(user.id, None)
+            await send_msg(ctx.bot, user.id, text=MOD_CLOSED_TEXT, parse_mode=ParseMode.HTML)
+            return
+
+        parsed = parse_mod_form(message.text)
+        if parsed is None:
+            await send_msg(ctx.bot, user.id, text=MOD_INVALID_FORM_TEXT, parse_mode=ParseMode.HTML)
+            return
+
+        if await has_active_mod_application(user.id):
+            await set_mod_state(user.id, None)
+            await send_msg(ctx.bot, user.id, text=MOD_WAITING_TEXT, parse_mode=ParseMode.HTML)
+            return
+
+        try:
+            app_id = await create_mod_application(
+                user_id=user.id,
+                round_started_at=rec["round_started_at"],
+                username_at_submit=user.username,
+                first_name_at_submit=user.first_name,
+                name=parsed["name"],
+                age=parsed["age"],
+                about=parsed["about"],
+                motivation=parsed["motivation"],
+                status="awaiting_video",
+            )
+        except Exception as e:
+            log.exception("create_mod_application failed for %s: %s", user.id, e)
+            await send_msg(
+                ctx.bot, user.id,
+                text="⚠️ Не удалось сохранить заявку. Попробуйте позже.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        await set_mod_state(user.id, "mod_awaiting_video")
+        await send_msg(ctx.bot, user.id, text=MOD_VIDEO_REQUEST_TEXT, parse_mode=ParseMode.HTML)
+        log.info("Mod app %s from %s — awaiting video", app_id, user.id)
+        return
+
+    if mod_state == "mod_awaiting_video":
+        await send_msg(ctx.bot, user.id, text=MOD_VIDEO_REMINDER_TEXT, parse_mode=ParseMode.HTML)
+        return
+
+    if mod_state == "mod_pending":
+        await send_msg(ctx.bot, user.id, text=MOD_WAITING_TEXT, parse_mode=ParseMode.HTML)
+        return
 
     if state in ("rejected", "approved"):
         return
@@ -1756,7 +2272,72 @@ async def on_user_video_note(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     db_user = await get_user(user.id)
-    if not db_user or db_user["state"] != "awaiting_video":
+    if not db_user:
+        return
+
+    if db_user["mod_state"] == "mod_awaiting_video":
+        rec = await get_recruitment()
+        if not rec or int(rec["is_open"]) == 0:
+            await set_mod_state(user.id, None)
+            await send_msg(ctx.bot, user.id, text=MOD_CLOSED_TEXT, parse_mode=ParseMode.HTML)
+            return
+
+        app_row = await get_latest_mod_application(user.id)
+        if app_row is None or app_row["status"] != "awaiting_video":
+            await set_mod_state(user.id, None)
+            return
+
+        app_id = app_row["id"]
+        file_id = message.video_note.file_id
+
+        try:
+            await set_mod_video_note(app_id, file_id)
+            await set_mod_application_status(app_id, "pending")
+            await set_mod_state(user.id, "mod_pending")
+            await mark_mod_applied(user.id, app_row["round_started_at"])
+        except Exception as e:
+            log.exception("Failed to finalize mod app %s: %s", app_id, e)
+            await send_msg(
+                ctx.bot, user.id,
+                text="⚠️ Ошибка сохранения. Попробуйте ещё раз.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        await send_msg(ctx.bot, user.id, text=MOD_WAITING_TEXT, parse_mode=ParseMode.HTML)
+
+        video_msg = await safe(
+            ctx.bot.send_video_note,
+            chat_id=ADMIN_CHAT_ID,
+            video_note=file_id,
+            **_mod_topic_kwargs(),
+        )
+        if video_msg is not None:
+            await set_mod_video_admin_msg_id(app_id, video_msg.message_id)
+
+        admin_text = _build_mod_admin_text(app_row, user)
+        send_kwargs = dict(
+            chat_id=ADMIN_CHAT_ID,
+            text=admin_text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=mod_decision_keyboard(app_id),
+            disable_web_page_preview=True,
+            **_mod_topic_kwargs(),
+        )
+        if video_msg is not None:
+            send_kwargs["reply_to_message_id"] = video_msg.message_id
+            send_kwargs["allow_sending_without_reply"] = True
+
+        admin_msg = await safe(ctx.bot.send_message, **send_kwargs)
+        if admin_msg is not None:
+            await set_mod_admin_msg_id(app_id, admin_msg.message_id)
+        else:
+            log.warning("Mod app %s — не доставлено в ветку, но в БД сохранено", app_id)
+
+        log.info("Mod app %s from %s fully submitted", app_id, user.id)
+        return
+
+    if db_user["state"] != "awaiting_video":
         return
 
     app_row = await get_latest_application(user.id)
@@ -1831,6 +2412,21 @@ async def on_join_request(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
 
     log.info("Join request from %s to chat %s via %s", user_id, chat_id, link_str)
 
+    if chat_id == _mod_chat_id():
+        if not await has_approved_mod_application(user_id):
+            try:
+                await ctx.bot.decline_chat_join_request(chat_id=chat_id, user_id=user_id)
+                log.warning("Mod join from %s declined: no approved app", user_id)
+            except Exception as e:
+                log.error("decline mod join failed for %s: %s", user_id, e)
+            return
+        try:
+            await ctx.bot.approve_chat_join_request(chat_id=chat_id, user_id=user_id)
+            log.info("Mod join from %s approved", user_id)
+        except Exception as e:
+            log.error("approve mod join failed for %s: %s", user_id, e)
+        return
+
     async def _decline(reason: str) -> None:
         try:
             await ctx.bot.decline_chat_join_request(chat_id=chat_id, user_id=user_id)
@@ -1890,8 +2486,23 @@ def _render_appeal_decision_text(original_text: str, status: str, admin_username
         header = "❌ <b>АПЕЛЛЯЦИЯ ОТКЛОНЕНА</b> ❌"
     elif status == "new_link":
         header = "🔁 <b>ВЫДАНА НОВАЯ ССЫЛКА</b>"
+    elif status == "mod_link":
+        header = "🛡 <b>ВЫДАНА ССЫЛКА НА АДМИН-ЧАТ</b>"
     else:
         header = "❓ <b>СТАТУС НЕИЗВЕСТЕН</b>"
+    return (
+        f"{header}\n"
+        f"<i>Решение: @{esc(admin_username)}</i>\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n\n{original_text}"
+    )
+
+
+def _render_mod_decision_text(original_text: str, approved: bool, admin_username: str) -> str:
+    header = (
+        "✅ <b>ЗАЯВКА НА МОДЕРАТОРА ПРИНЯТА</b> ✅"
+        if approved
+        else "❌ <b>ЗАЯВКА НА МОДЕРАТОРА ОТКЛОНЕНА</b> ❌"
+    )
     return (
         f"{header}\n"
         f"<i>Решение: @{esc(admin_username)}</i>\n\n"
@@ -1932,6 +2543,33 @@ async def _finalize_appeal_admin_message(bot, msg_id: Optional[int], original_te
         return
 
     new_text = _render_appeal_decision_text(original_text, status, admin_username)
+
+    edited = await safe(
+        bot.edit_message_text,
+        chat_id=ADMIN_CHAT_ID,
+        message_id=msg_id,
+        text=new_text,
+        parse_mode=ParseMode.HTML,
+        reply_markup=None,
+        disable_web_page_preview=True,
+    )
+    if edited is not None:
+        return
+
+    await safe(
+        bot.edit_message_reply_markup,
+        chat_id=ADMIN_CHAT_ID,
+        message_id=msg_id,
+        reply_markup=None,
+    )
+
+
+async def _finalize_mod_admin_message(bot, msg_id: Optional[int], original_text: str,
+                                      approved: bool, admin_username: str) -> None:
+    if not msg_id:
+        return
+
+    new_text = _render_mod_decision_text(original_text, approved, admin_username)
 
     edited = await safe(
         bot.edit_message_text,
@@ -2346,6 +2984,437 @@ async def cb_appeal_newlink(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
     log.info("Appeal %s: new link sent to user %s by %s", appeal_id, target_user_id, user.id)
 
 
+async def cb_appeal_modlink(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    user = update.effective_user
+    if query is None or user is None or query.message is None:
+        return
+
+    if is_cb_throttled(user.id):
+        await safe(query.answer)
+        return
+
+    if query.message.chat_id != ADMIN_CHAT_ID:
+        await safe(query.answer, "Недоступно", show_alert=False)
+        return
+    if not await _is_admin(ctx.bot, ADMIN_CHAT_ID, user.id):
+        await safe(query.answer, "Только для участников админ-чата", show_alert=True)
+        return
+
+    appeal_id = int(query.data.split(":", 1)[1])
+    appeal_row = await get_appeal(appeal_id)
+    if not appeal_row:
+        await safe(
+            query.answer,
+            "Апелляция не найдена в БД. Обработайте вручную.",
+            show_alert=True,
+        )
+        await _strip_buttons_from_query(ctx, query)
+        return
+
+    target_user_id = appeal_row["user_id"]
+
+    link = await _generate_mod_chat_invite(ctx.bot, target_user_id)
+    if not link:
+        await safe(query.answer, "Не удалось создать ссылку", show_alert=True)
+        return
+
+    await safe(
+        ctx.bot.send_message,
+        chat_id=target_user_id,
+        text=(
+            "🔁 <b>Вам выдана ссылка на админ-чат</b>\n\n"
+            f"🔗 <b>Ссылка:</b> {link}\n\n"
+            "<i>Ссылка одноразовая, действует 1 час.</i>"
+        ),
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
+    )
+
+    await _strip_buttons_from_query(ctx, query)
+    await safe(query.answer, "Ссылка отправлена")
+    log.info("Appeal %s: mod chat link sent to user %s by %s",
+             appeal_id, target_user_id, user.id)
+
+
+async def cb_mod_apply(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    user = update.effective_user
+    if query is None or user is None:
+        return
+    if is_cb_throttled(user.id):
+        await safe(query.answer)
+        return
+    if await is_blacklisted(user.id):
+        await safe(query.answer, "Доступ заблокирован.", show_alert=True)
+        return
+
+    rec = await get_recruitment()
+    if not rec or int(rec["is_open"]) == 0:
+        await safe(query.answer, "Набор закрыт.", show_alert=True)
+        if query.message is not None:
+            await strip_buttons(ctx.bot, user.id, query.message.message_id)
+        return
+
+    db_user = await get_user(user.id)
+    if not db_user or db_user["state"] != "approved":
+        await safe(query.answer, "Подать заявку можно только участникам чата.", show_alert=True)
+        return
+
+    if db_user["mod_state"] in ("mod_awaiting_form", "mod_awaiting_video"):
+        await safe(query.answer, "Ты уже заполняешь заявку. Продолжай по шаблону.", show_alert=True)
+        return
+    if db_user["mod_state"] == "mod_pending":
+        await safe(query.answer, "Заявка уже на рассмотрении.", show_alert=True)
+        return
+    if await has_active_mod_application(user.id):
+        await safe(query.answer, "Заявка уже на рассмотрении.", show_alert=True)
+        return
+
+    resp = await get_mod_response(user.id, rec["round_started_at"])
+    if resp is not None:
+        if int(resp["refused"]) == 1:
+            await safe(query.answer, "Ты отказался в этом наборе. Жди следующий.", show_alert=True)
+            return
+        if int(resp["applied"]) == 1:
+            await safe(query.answer, "Ты уже подал заявку в этом наборе.", show_alert=True)
+            return
+
+    await set_mod_state(user.id, "mod_awaiting_form")
+    if query.message is not None:
+        await strip_buttons(ctx.bot, user.id, query.message.message_id)
+    await send_msg(
+        ctx.bot, user.id,
+        text=MOD_FORM_TEXT,
+        parse_mode=ParseMode.HTML,
+    )
+    await safe(query.answer)
+    log.info("User %s started mod form (round %s)", user.id, rec["round_started_at"])
+
+
+async def cb_mod_refuse(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    user = update.effective_user
+    if query is None or user is None:
+        return
+    if is_cb_throttled(user.id):
+        await safe(query.answer)
+        return
+
+    rec = await get_recruitment()
+    if not rec or int(rec["is_open"]) == 0:
+        await safe(query.answer, "Набор уже закрыт.", show_alert=True)
+        if query.message is not None:
+            await strip_buttons(ctx.bot, user.id, query.message.message_id)
+        return
+
+    resp = await get_mod_response(user.id, rec["round_started_at"])
+    if resp is not None and int(resp["refused"]) == 1:
+        await safe(query.answer, "Ты уже отказался.", show_alert=True)
+        return
+    if resp is not None and int(resp["applied"]) == 1:
+        await safe(query.answer, "Ты уже подал заявку.", show_alert=True)
+        return
+
+    await mark_mod_refused(user.id, rec["round_started_at"])
+    await set_mod_state(user.id, None)
+
+    if query.message is not None:
+        await strip_buttons(ctx.bot, user.id, query.message.message_id)
+
+    await send_msg(
+        ctx.bot, user.id,
+        text=MOD_REFUSED_TEXT,
+        parse_mode=ParseMode.HTML,
+    )
+    await safe(query.answer, "Ок, в этом наборе больше не напомним.")
+    log.info("User %s refused mod recruitment (round %s)", user.id, rec["round_started_at"])
+
+
+async def cb_mod_approve(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    user = update.effective_user
+    if query is None or user is None or query.message is None:
+        return
+    if is_cb_throttled(user.id):
+        await safe(query.answer)
+        return
+    if query.message.chat_id != ADMIN_CHAT_ID:
+        await safe(query.answer, "Недоступно", show_alert=False)
+        return
+    if not await _is_admin(ctx.bot, ADMIN_CHAT_ID, user.id):
+        await safe(query.answer, "Только для участников админ-чата", show_alert=True)
+        return
+
+    app_id = int(query.data.split(":", 1)[1])
+    app_row = await get_mod_application(app_id)
+    if not app_row:
+        await safe(query.answer, "Заявка не найдена в БД.", show_alert=True)
+        await _strip_buttons_from_query(ctx, query)
+        return
+
+    target_user_id = app_row["user_id"]
+    won = await try_decide_mod_application(app_id, "approved", user.id)
+    if not won:
+        await safe(query.answer, "Уже обработана", show_alert=False)
+        await _strip_buttons_from_query(ctx, query)
+        return
+
+    await set_mod_state(target_user_id, None)
+
+    invite = await _generate_mod_chat_invite(ctx.bot, target_user_id)
+    if invite:
+        approved_msg = (
+            f"{MOD_APPROVED_MSG}\n\n"
+            f"🔗 <b>Ссылка на админ-чат:</b> {invite}\n\n"
+            "<i>Ссылка одноразовая, действует 1 час.</i>"
+        )
+    else:
+        approved_msg = MOD_APPROVED_MSG_NO_LINK
+
+    await safe(
+        ctx.bot.send_message,
+        chat_id=target_user_id,
+        text=approved_msg,
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
+    )
+
+    admin_username = user.username or user.full_name
+    await _finalize_mod_admin_message(
+        ctx.bot,
+        app_row["admin_msg_id"],
+        query.message.text or query.message.caption or "",
+        approved=True,
+        admin_username=admin_username,
+    )
+    await safe(query.answer, "Одобрено")
+    log.info("Mod app %s approved by %s (user %s)", app_id, user.id, target_user_id)
+
+
+async def cb_mod_reject(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    user = update.effective_user
+    if query is None or user is None or query.message is None:
+        return
+    if is_cb_throttled(user.id):
+        await safe(query.answer)
+        return
+    if query.message.chat_id != ADMIN_CHAT_ID:
+        await safe(query.answer, "Недоступно", show_alert=False)
+        return
+    if not await _is_admin(ctx.bot, ADMIN_CHAT_ID, user.id):
+        await safe(query.answer, "Только для участников админ-чата", show_alert=True)
+        return
+
+    app_id = int(query.data.split(":", 1)[1])
+    app_row = await get_mod_application(app_id)
+    if not app_row:
+        await safe(query.answer, "Заявка не найдена в БД.", show_alert=True)
+        await _strip_buttons_from_query(ctx, query)
+        return
+
+    target_user_id = app_row["user_id"]
+    won = await try_decide_mod_application(app_id, "rejected", user.id)
+    if not won:
+        await safe(query.answer, "Уже обработана", show_alert=False)
+        await _strip_buttons_from_query(ctx, query)
+        return
+
+    await set_mod_state(target_user_id, None)
+    await safe(
+        ctx.bot.send_message,
+        chat_id=target_user_id,
+        text=MOD_REJECTED_MSG,
+        parse_mode=ParseMode.HTML,
+    )
+
+    admin_username = user.username or user.full_name
+    await _finalize_mod_admin_message(
+        ctx.bot,
+        app_row["admin_msg_id"],
+        query.message.text or query.message.caption or "",
+        approved=False,
+        admin_username=admin_username,
+    )
+    await safe(query.answer, "Отклонено")
+    log.info("Mod app %s rejected by %s (user %s)", app_id, user.id, target_user_id)
+
+
+async def _broadcast_mod_open(bot, user_ids: list[int], round_started_at: str) -> None:
+    sent = 0
+    failed = 0
+    for uid in user_ids:
+        try:
+            msg = await safe(
+                bot.send_message,
+                chat_id=uid,
+                text=MOD_OPEN_TEXT,
+                parse_mode=ParseMode.HTML,
+                reply_markup=mod_invite_keyboard(),
+            )
+            if msg is not None:
+                await mark_mod_notified(uid, round_started_at)
+                sent += 1
+            else:
+                failed += 1
+        except Exception as e:
+            failed += 1
+            log.warning("mod broadcast to %s failed: %s", uid, e)
+        await asyncio.sleep(0.05)
+
+    try:
+        await safe(
+            bot.send_message,
+            chat_id=ADMIN_CHAT_ID,
+            text=(
+                f"📣 <b>Рассылка о наборе завершена</b>\n\n"
+                f"✅ Доставлено: <b>{sent}</b>\n"
+                f"⚠️ Ошибок: <b>{failed}</b>"
+            ),
+            parse_mode=ParseMode.HTML,
+            **_mod_topic_kwargs(),
+        )
+    except Exception:
+        pass
+    log.info("Mod broadcast done: sent=%d, failed=%d", sent, failed)
+
+
+async def _broadcast_mod_closed(bot, user_ids: list[int]) -> None:
+    sent = 0
+    failed = 0
+    for uid in user_ids:
+        try:
+            msg = await safe(
+                bot.send_message,
+                chat_id=uid,
+                text=MOD_CLOSED_TEXT,
+                parse_mode=ParseMode.HTML,
+            )
+            if msg is not None:
+                sent += 1
+            else:
+                failed += 1
+        except Exception as e:
+            failed += 1
+            log.warning("mod close broadcast to %s failed: %s", uid, e)
+        await asyncio.sleep(0.05)
+
+    try:
+        await safe(
+            bot.send_message,
+            chat_id=ADMIN_CHAT_ID,
+            text=(
+                f"📪 <b>Рассылка о закрытии завершена</b>\n\n"
+                f"✅ Доставлено: <b>{sent}</b>\n"
+                f"⚠️ Ошибок: <b>{failed}</b>"
+            ),
+            parse_mode=ParseMode.HTML,
+            **_mod_topic_kwargs(),
+        )
+    except Exception:
+        pass
+    log.info("Mod close broadcast done: sent=%d, failed=%d", sent, failed)
+
+
+async def cmd_unnabor(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    user = update.effective_user
+    if message is None or user is None:
+        return
+    if message.chat_id != ADMIN_CHAT_ID:
+        return
+    if not await _is_admin(ctx.bot, ADMIN_CHAT_ID, user.id):
+        return
+
+    opened = await open_recruitment(user.id)
+    if not opened:
+        await safe(
+            message.reply_text,
+            "⚠️ Набор уже открыт. Сначала закройте текущий: /offnaboe",
+            **_mod_topic_kwargs(),
+        )
+        return
+
+    rec = await get_recruitment()
+    round_started_at = rec["round_started_at"] if rec else None
+    if not round_started_at:
+        await safe(message.reply_text, "⚠️ Не удалось определить раунд набора.")
+        return
+
+    approved_ids = await get_approved_users_ids()
+    eligible: list[int] = []
+    for uid in approved_ids:
+        if await has_pending_mod_application(uid):
+            continue
+        eligible.append(uid)
+
+    await safe(
+        message.reply_text,
+        (
+            f"🛡 <b>Набор модераторов открыт</b>\n\n"
+            f"👥 Получателей: <b>{len(eligible)}</b>\n"
+            f"⏳ Рассылка идёт в фоне — я пришлю сводку, когда закончу."
+        ),
+        parse_mode=ParseMode.HTML,
+        **_mod_topic_kwargs(),
+    )
+
+    asyncio.create_task(
+        _broadcast_mod_open(ctx.bot, eligible, round_started_at)
+    )
+    log.info("/unnabor: opened round %s, eligible=%d", round_started_at, len(eligible))
+
+
+async def cmd_offnaboe(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    user = update.effective_user
+    if message is None or user is None:
+        return
+    if message.chat_id != ADMIN_CHAT_ID:
+        return
+    if not await _is_admin(ctx.bot, ADMIN_CHAT_ID, user.id):
+        return
+
+    rec = await get_recruitment()
+    if not rec or int(rec["is_open"]) == 0:
+        await safe(
+            message.reply_text,
+            "⚠️ Набор не открыт.",
+            **_mod_topic_kwargs(),
+        )
+        return
+
+    round_started_at = rec["round_started_at"]
+    closed = await close_recruitment(user.id)
+    if not closed:
+        await safe(message.reply_text, "⚠️ Не удалось закрыть набор.")
+        return
+
+    reset_count = await reset_stuck_mod_states()
+
+    notified_ids = await get_notified_users_ids(round_started_at) if round_started_at else []
+
+    await safe(
+        message.reply_text,
+        (
+            f"📪 <b>Набор модераторов закрыт</b>\n\n"
+            f"👥 Получателей: <b>{len(notified_ids)}</b>\n"
+            f"🧹 Сброшено незавершённых заявок: <b>{reset_count}</b>\n"
+            f"⏳ Рассылка идёт в фоне."
+        ),
+        parse_mode=ParseMode.HTML,
+        **_mod_topic_kwargs(),
+    )
+
+    if notified_ids:
+        asyncio.create_task(
+            _broadcast_mod_closed(ctx.bot, notified_ids)
+        )
+    log.info("/offnaboe: closed round %s, notified=%d, reset=%d",
+             round_started_at, len(notified_ids), reset_count)
+
+
 async def cmd_untimeban(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
     user = update.effective_user
@@ -2455,10 +3524,16 @@ async def _build_app() -> Application:
     app.add_handler(CallbackQueryHandler(cb_appeal_approve, pattern=r"^appeal_approve:"))
     app.add_handler(CallbackQueryHandler(cb_appeal_reject,  pattern=r"^appeal_reject:"))
     app.add_handler(CallbackQueryHandler(cb_appeal_newlink, pattern=r"^appeal_newlink:"))
+    app.add_handler(CallbackQueryHandler(cb_appeal_modlink, pattern=r"^appeal_modlink:"))
     app.add_handler(CallbackQueryHandler(cb_ping_admins, pattern=r"^ping_admins$"))
     app.add_handler(CallbackQueryHandler(cb_agree,   pattern=r"^agree$"))
     app.add_handler(CallbackQueryHandler(cb_refuse,  pattern=r"^refuse$"))
     app.add_handler(CallbackQueryHandler(cb_appeal_start, pattern=r"^appeal_start$"))
+
+    app.add_handler(CallbackQueryHandler(cb_mod_apply,   pattern=r"^mod_apply$"))
+    app.add_handler(CallbackQueryHandler(cb_mod_refuse,  pattern=r"^mod_refuse$"))
+    app.add_handler(CallbackQueryHandler(cb_mod_approve, pattern=r"^mod_approve:"))
+    app.add_handler(CallbackQueryHandler(cb_mod_reject,  pattern=r"^mod_reject:"))
 
     app.add_handler(CommandHandler(
         "start", cmd_start,
@@ -2470,6 +3545,14 @@ async def _build_app() -> Application:
     ))
     app.add_handler(CommandHandler(
         "unperm", cmd_unperm,
+        filters=filters.Chat(ADMIN_CHAT_ID),
+    ))
+    app.add_handler(CommandHandler(
+        "unnabor", cmd_unnabor,
+        filters=filters.Chat(ADMIN_CHAT_ID),
+    ))
+    app.add_handler(CommandHandler(
+        "offnaboe", cmd_offnaboe,
         filters=filters.Chat(ADMIN_CHAT_ID),
     ))
 
@@ -2501,9 +3584,10 @@ async def _start_with_retry() -> Application:
                 poll_interval=1.0,
                 timeout=30,
             )
-            log.info("Bot running. App thread: %s. Appeal thread: %s. Target chat: %s. "
+            log.info("Bot running. App thread: %s. Appeal thread: %s. Mod thread: %s. Mod chat: %s. Target chat: %s. "
                      "Slot limit: %d, session timeout: %.0f сек.",
-                     TOPIC_THREAD_ID, APPEAL_THREAD_ID, TARGET_CHAT_ID,
+                     TOPIC_THREAD_ID, APPEAL_THREAD_ID, MODERATOR_THREAD_ID,
+                     _mod_chat_id(), TARGET_CHAT_ID,
                      SOFT_PARALLEL_LIMIT, SESSION_TIMEOUT)
             return app
         except (TimedOut, NetworkError) as e:
