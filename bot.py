@@ -1611,8 +1611,22 @@ def _blocked_text(until_str: str) -> str:
     )
 
 
+async def _try_unban(bot, chat_id: int, user_id: int) -> None:
+    try:
+        await bot.unban_chat_member(
+            chat_id=chat_id,
+            user_id=user_id,
+            only_if_banned=True,
+        )
+        log.info("Unbanned (if banned) %s in chat %s", user_id, chat_id)
+    except Exception as e:
+        log.debug("unban %s in chat %s skipped/failed: %s", user_id, chat_id, e)
+
+
 async def _generate_invite_link(bot, user_id: int) -> Optional[str]:
     expire_at = datetime.now(timezone.utc) + timedelta(hours=1)
+
+    await _try_unban(bot, TARGET_CHAT_ID, user_id)
 
     try:
         invite = await bot.create_chat_invite_link(
@@ -1648,6 +1662,8 @@ async def _generate_invite_link(bot, user_id: int) -> Optional[str]:
 async def _generate_mod_chat_invite(bot, user_id: int) -> Optional[str]:
     expire_at = datetime.now(timezone.utc) + timedelta(hours=1)
     chat_id = _mod_chat_id()
+
+    await _try_unban(bot, chat_id, user_id)
 
     try:
         invite = await bot.create_chat_invite_link(
